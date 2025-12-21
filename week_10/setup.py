@@ -3,7 +3,7 @@
 import os
 from setuptools import find_packages, setup
 
-package_name = 'week_8'
+package_name = 'week_10'
 
 data_files=[
     ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
@@ -38,26 +38,18 @@ setup(
     name=package_name,
     version='0.0.0',
     packages=find_packages(exclude=['test']),
-    data_files=package_files(data_files, ['models/', 'launch/', 'worlds/', 'rviz/', 'urdf/', 'maps/', 'params/']),
+    data_files=package_files(data_files, ['models/', 'launch/', 'worlds/', 'rviz/']),
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='am567',
-    maintainer_email='alan.millard@york.ac.uk',
+    maintainer='pfr500',
+    maintainer_email='pedro.ribeiro@york.ac.uk',
     description='TODO: Package description',
     license='TODO: License declaration',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'robot_controller = week_8.robot_controller:main',
-            'joint_state_republisher = week_8.joint_state_republisher:main',
-            'path_publisher = week_8.path_publisher:main',
-            'autonomous_navigation = week_8.autonomous_navigation:main',
-            'autonomous_navigation_multithreaded = week_8.autonomous_navigation_multithreaded:main',
-            'task2 = week_8.task2:main',
-            'task3 = week_8.task3:main',
-            'task4 = week_8.task4:main',
-            'task5 = week_8.task5:main',
-            'task8 = week_8.task8:main'
+            'lidar_fault = week_10.lidar_fault:main',
+            'robot_controller = week_10.robot_controller:main',
         ],
     },
 )
