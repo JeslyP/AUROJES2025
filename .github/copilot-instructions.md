@@ -1,0 +1,20 @@
+# AUROJES2025 Copilot Guide
+- This is a ROS2 Humble colcon workspace for the AURO 2025 course; core packages: assessment (simulation), assessment_interfaces, auro_interfaces (messages/services), gazebo_ros_link_attacher (Gazebo plugin), solution (your implementation), week_1..week_8 practice packages.
+- Read the simulation and task constraints in [assessment/README.md](assessment/README.md); do not modify assessment, assessment_interfaces, gazebo_ros_link_attacher, or the ItemRequest.srv definition in auro_interfaces/msg/srv files.
+- solution is the primary code target; launch via [solution/launch/solution_launch.py](solution/launch/solution_launch.py) which composes assessment_launch.py and exposes many scenario arguments (num_robots, sensor_noise, use_nav2, headless, barrels, etc.). Initial poses live in [solution/config/initial_poses.yaml](solution/config/initial_poses.yaml).
+- Gazebo plugin services `/attach` and `/detach` come from [gazebo_ros_link_attacher](gazebo_ros_link_attacher/README.md); barrel pickup/offload/decontaminate services and topics are documented in assessment README.
+- Devcontainer scenarios drive launches; declare them in [.devcontainer/devcontainer.json](.devcontainer/devcontainer.json) under customizations.auro.scenarios with parameter maps passed to solution_launch.py.
+- Preferred workflow uses the helper CLI [rcutil.py](rcutil.py):
+  - `./rcutil.py build` runs `colcon build --symlink-install` with ROS env reset.
+  - `./rcutil.py check-submission` verifies workspace consistency; run before zipping.
+  - `./rcutil.py list-launch` and `list-scenarios` inspect launch args and scenarios; `run-scenario` executes a named scenario using devcontainer config.
+  - `./rcutil.py clean` removes build/install/log; `install-dependencies` installs apt/pip entries from devcontainer.json.
+- If using raw colcon: source /opt/ros/humble/setup.bash, then `colcon build --symlink-install`; avoid sourcing install/setup.bash from stale builds.
+- Launch examples: `ros2 launch solution solution_launch.py --show-args` to discover parameters; typical runs set `use_rviz:=false` for headless speed and `limit_real_time_factor:=false` for faster-than-real-time.
+- Data logging: [solution/solution/data_logger.py](solution/solution/data_logger.py) is wired via solution_launch.py with `data_log_path`/`data_log_filename` parameters.
+- Sensor processing: visual_sensor publishes barrel/zone detections; enable debug overlays with `vision_sensor_debug:=true` or throttle via `vision_sensor_frame_divider`. dynamic_mask filters LiDAR to `scan_filtered`; Nav2 configs and RViz defaults expect that topic.
+- Multi-robot: robot namespaces are robotX; services/topics (e.g., `/pick_up_item`, `/offload_item`) require robot ID in ItemRequest.
+- Worlds, models, and RViz configs live under package-specific `models/`, `worlds/`, `rviz/`, `config/` folders; assessment assets drive the main simulation.
+- Practice content under week_*/ is auxiliary; solution package must remain launch-compatible with assessment while allowing added parameters or extra ROS2 packages you create.
+- Submission packaging: use `./rcutil.py zip-workspace` after `check-submission`; ensure .devcontainer/devcontainer.json uses auro-vnc config with scenarios defined.
+- Keep new files ASCII and mirror existing ROS2 style (ament, launch descriptions, params via DeclareLaunchArgument). Add comments sparingly for non-obvious logic.
