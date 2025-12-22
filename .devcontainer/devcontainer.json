@@ -23,5 +23,47 @@
   },
   "containerEnv": {
     "VNC_RESOLUTION": "1280x720x24"
+  },
+  "customizations": {
+    "auro": {
+      "scenarios": [
+        {
+          "name": "3 Robots (GUI)",
+          "description": "Three robots, Gazebo GUI enabled, RViz disabled.",
+          "parameters": {
+            "num_robots": 3,
+            "use_rviz": "false",
+            "barrels": "true",
+            "wait_for_barrels": "true",
+            "headless": "false",
+            "limit_real_time_factor": "true"
+          }
+        },
+        {
+          "name": "3 Robots (Headless)",
+          "description": "Three robots, headless, runs faster than real-time, RViz disabled.",
+          "parameters": {
+            "num_robots": 3,
+            "use_rviz": "false",
+            "barrels": "true",
+            "wait_for_barrels": "true",
+            "headless": "true",
+            "limit_real_time_factor": "false"
+          }
+        },
+        {
+          "name": "1 Robot (GUI)",
+          "description": "Single robot, Gazebo GUI enabled, RViz disabled.",
+          "parameters": {
+            "num_robots": 1,
+            "use_rviz": "false",
+            "barrels": "true",
+            "wait_for_barrels": "true",
+            "headless": "false",
+            "limit_real_time_factor": "true"
+          }
+        }
+      ]
+    }
   }
 }

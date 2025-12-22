@@ -74,7 +74,7 @@ class DataLogger(Node):
 
 def main(args=sys.argv):
 
-    rclpy.init(args = args, signal_handler_options = SignalHandlerOptions.NO)
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.ALL)
 
     args_without_ros = rclpy.utilities.remove_ros_args(args)
 
@@ -85,7 +85,7 @@ def main(args=sys.argv):
     except KeyboardInterrupt:
         pass
     except ExternalShutdownException:
-        sys.exit(1)
+        pass
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
