@@ -1,14 +1,9 @@
-#!/usr/bin/env python3
-
 import rclpy
 from rclpy.node import Node
-from rclpy.action import ActionClient
-from geometry_msgs.msg import Twist, PoseStamped
-from sensor_msgs.msg import LaserScan, Image
-from nav2_msgs.action import NavigateToPose
-from cv_bridge import CvBridge
-import cv2
-import numpy as np
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import LaserScan
+from assessment_interfaces.msg import BarrelList, ZoneList
+from auro_interfaces.srv import ItemRequest
 from enum import Enum
 import math
 
@@ -16,152 +11,153 @@ class State(Enum):
     EXPLORING = 1
     APPROACHING_BARREL = 2
     PICKING_UP = 3
-    AVOIDING_WALL = 4
-    NAVIGATING = 5
-
-class BarrelColor(Enum):
-    # Define barrel color codes and zones
-    # Barrel colors
-    RED = ([0, 150, 52], [10, 255, 255])
-    BLUE = ([111, 150, 51], [130, 255, 255])
-    #Zone colors
-    CYAN_ZONE = ([82, 97, 0], [179, 255, 255])
-    GREEN_ZONE = ([60, 97, 0], [79, 255, 255])
-
-
+    CARRYING_TO_ZONE = 4
+    APPROACHING_ZONE = 5
+    DEPOSITING = 6
+    NEEDS_DECONTAMINATION = 7
+    APPROACHING_DECON = 8
+    DECONTAMINATING = 9
+    AVOIDING_WALL = 10
 
 class AutonomousBarrelCollector(Node):
     def __init__(self):
         super().__init__('autonomous_barrel_collector')
         
+        # Parameters
+        self.declare_parameter('robot_id', 'robot1')
+        self.robot_id = self.get_parameter('robot_id').value
+        
         # Publishers
-        self.cmd_vel_pub = self.create_publisher(Twist, '/robot1/cmd_vel', 10)
+        self.cmd_vel_pub = self.create_publisher(
+            Twist, f'/{self.robot_id}/cmd_vel', 10)
         
         # Subscribers
         self.laser_sub = self.create_subscription(
-            LaserScan, '/robot1/scan', self.laser_callback, 10)
-        self.camera_sub = self.create_subscription(
-            Image, '/robot1/camera/image_raw', self.camera_callback, 10)
+            LaserScan, f'/{self.robot_id}/scan', self.laser_callback, 10)
+        self.barrels_sub = self.create_subscription(
+            BarrelList, f'/{self.robot_id}/barrels', self.barrels_callback, 10)
+        self.zones_sub = self.create_subscription(
+            ZoneList, f'/{self.robot_id}/zones', self.zones_callback, 10)
         
-        # Nav2 Action Client
-        self.nav_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        # Service clients
+        self.pickup_client = self.create_service_client(ItemRequest, '/pick_up_item')
+        self.offload_client = self.create_service_client(ItemRequest, '/offload_item')
+        self.decon_client = self.create_service_client(ItemRequest, '/decontaminate')
         
         # State machine
         self.state = State.EXPLORING
-        self.previous_state = None
         
-        # Barrel detection
-        self.bridge = CvBridge()
-        self.detected_barrel = None
-        self.barrel_center_x = None
+        # Detection data
+        self.visible_barrels = []
+        self.visible_zones = []
+        self.target_barrel = None
+        self.target_zone = None
+        
+        # Carrying state
+        self.carrying_barrel = False
+        self.barrel_color = None
+        self.is_contaminated = False
         
         # Laser scan data
         self.front_distance = float('inf')
         self.left_distance = float('inf')
         self.right_distance = float('inf')
-        self.scan_ranges = None
         
         # Parameters
-        self.barrel_approach_distance = 0.3  # Stop 30cm from barrel
-        self.wall_stop_distance = 0.5  # Stop 50cm from wall
-        self.rotation_angle = 30.0  # Rotate 30 degrees when avoiding walls
-        self.angular_speed = 0.5
+        self.barrel_approach_threshold = 0.35  # When to pick up
+        self.zone_approach_threshold = 0.25    # When to deposit
+        self.decon_approach_threshold = 0.25   # When to decontaminate
+        self.wall_stop_distance = 0.5
         self.linear_speed = 0.2
+        self.approach_speed = 0.12
+        self.angular_speed = 0.5
+        
+        # Statistics
+        self.barrels_collected = 0
+        self.barrels_deposited = 0
         
         # Control timer
         self.timer = self.create_timer(0.1, self.control_loop)
         
-        self.get_logger().info('Autonomous Barrel Collector Node Started')
+        self.get_logger().info('='*60)
+        self.get_logger().info(f'Autonomous Barrel Collector Started')
+        self.get_logger().info(f'Robot ID: {self.robot_id}')
+        self.get_logger().info('Task: Collect barrels → Deposit in GREEN zones')
+        self.get_logger().info('='*60)
+    
+    def create_service_client(self, srv_type, srv_name):
+        """Create service client and wait for service"""
+        client = self.create_client(srv_type, srv_name)
+        return client
     
     def laser_callback(self, msg):
-        """Process laser scan data for obstacle detection"""
-        self.scan_ranges = msg.ranges
-        
-        # Get distances in key directions
-        # Front (0 degrees)
+        """Process laser scan for obstacle detection"""
+        # Front distance
         front_indices = list(range(0, 10)) + list(range(len(msg.ranges)-10, len(msg.ranges)))
-        self.front_distance = min([msg.ranges[i] for i in front_indices if not math.isinf(msg.ranges[i])] or [float('inf')])
+        front_readings = [msg.ranges[i] for i in front_indices if not math.isinf(msg.ranges[i])]
+        self.front_distance = min(front_readings) if front_readings else float('inf')
         
-        # Left (90 degrees)
+        # Left distance (90 degrees)
         left_start = len(msg.ranges) // 4
         left_indices = range(left_start - 10, left_start + 10)
-        self.left_distance = min([msg.ranges[i] for i in left_indices if i < len(msg.ranges) and not math.isinf(msg.ranges[i])] or [float('inf')])
+        left_readings = [msg.ranges[i] for i in left_indices if i < len(msg.ranges) and not math.isinf(msg.ranges[i])]
+        self.left_distance = min(left_readings) if left_readings else float('inf')
         
-        # Right (270 degrees)
+        # Right distance (270 degrees)
         right_start = 3 * len(msg.ranges) // 4
         right_indices = range(right_start - 10, right_start + 10)
-        self.right_distance = min([msg.ranges[i] for i in right_indices if i < len(msg.ranges) and not math.isinf(msg.ranges[i])] or [float('inf')])
+        right_readings = [msg.ranges[i] for i in right_indices if i < len(msg.ranges) and not math.isinf(msg.ranges[i])]
+        self.right_distance = min(right_readings) if right_readings else float('inf')
     
-    def camera_callback(self, msg):
-        """Process camera images for barrel detection"""
-        try:
-            cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
-            hsv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2HSV)
-            
-            # Detect barrels by color
-            barrel_detected = False
-            largest_contour = None
-            largest_area = 0
-            
-            for color in BarrelColor:
-                lower, upper = color.value
-                mask = cv2.inRange(hsv_image, np.array(lower), np.array(upper))
-                
-                # Find contours
-                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                for contour in contours:
-                    area = cv2.contourArea(contour)
-                    if area > 500:  # Minimum area threshold
-                        if area > largest_area:
-                            largest_area = area
-                            largest_contour = contour
-                            self.detected_barrel = color.name
-                            barrel_detected = True
-            
-            if barrel_detected and largest_contour is not None:
-                # Get barrel position
-                M = cv2.moments(largest_contour)
-                if M['m00'] > 0:
-                    self.barrel_center_x = int(M['m10'] / M['m00'])
-                    image_center = cv_image.shape[1] / 2
-                    
-                    # Log detection
-                    self.get_logger().info(f'Detected {self.detected_barrel} barrel at x={self.barrel_center_x}')
-            else:
-                self.detected_barrel = None
-                self.barrel_center_x = None
-                
-        except Exception as e:
-            self.get_logger().error(f'Camera processing error: {str(e)}')
+    def barrels_callback(self, msg):
+        """Process barrel detections from visual sensor"""
+        self.visible_barrels = msg.barrels
+    
+    def zones_callback(self, msg):
+        """Process zone detections from visual sensor"""
+        self.visible_zones = msg.zones
     
     def control_loop(self):
-        """Main control loop implementing state machine"""
+        """Main control loop with state machine"""
         twist = Twist()
         
-        # State machine logic
+        # State machine
         if self.state == State.EXPLORING:
             self.explore(twist)
         elif self.state == State.APPROACHING_BARREL:
             self.approach_barrel(twist)
-        elif self.state == State.AVOIDING_WALL:
-            self.avoid_wall(twist)
         elif self.state == State.PICKING_UP:
             self.pickup_barrel(twist)
+        elif self.state == State.CARRYING_TO_ZONE:
+            self.carry_to_zone(twist)
+        elif self.state == State.APPROACHING_ZONE:
+            self.approach_zone(twist)
+        elif self.state == State.DEPOSITING:
+            self.deposit_barrel(twist)
+        elif self.state == State.NEEDS_DECONTAMINATION:
+            self.seek_decontamination(twist)
+        elif self.state == State.APPROACHING_DECON:
+            self.approach_decon(twist)
+        elif self.state == State.DECONTAMINATING:
+            self.decontaminate(twist)
+        elif self.state == State.AVOIDING_WALL:
+            self.avoid_wall(twist)
         
         self.cmd_vel_pub.publish(twist)
     
     def explore(self, twist):
-        """Exploration behavior - move forward and look for barrels"""
-        # Check for walls first
+        """Explore and search for barrels"""
+        # Check for wall
         if self.front_distance < self.wall_stop_distance:
-            self.get_logger().info('Wall detected! Switching to avoidance')
+            self.get_logger().info('Wall detected! Avoiding...')
             self.state = State.AVOIDING_WALL
             return
         
-        # Check for barrels
-        if self.detected_barrel is not None:
-            self.get_logger().info(f'Barrel detected! Approaching {self.detected_barrel} barrel')
+        # Look for barrels
+        if len(self.visible_barrels) > 0:
+            # Find closest barrel
+            self.target_barrel = min(self.visible_barrels, key=lambda b: abs(b.x))
+            self.get_logger().info(f'Barrel detected! Color: {self.target_barrel.colour}, x={self.target_barrel.x:.2f}')
             self.state = State.APPROACHING_BARREL
             return
         
@@ -171,86 +167,250 @@ class AutonomousBarrelCollector(Node):
     
     def approach_barrel(self, twist):
         """Approach detected barrel"""
-        if self.detected_barrel is None:
+        if len(self.visible_barrels) == 0 or self.target_barrel is None:
             self.get_logger().warn('Lost sight of barrel, returning to exploration')
+            self.target_barrel = None
             self.state = State.EXPLORING
             return
         
-        # Check if we're close enough
-        if self.front_distance < self.barrel_approach_distance:
-            self.get_logger().info('Reached barrel! Initiating pickup')
+        # Update target to closest barrel
+        self.target_barrel = min(self.visible_barrels, key=lambda b: abs(b.x))
+        
+        # Check if close enough
+        if self.front_distance < self.barrel_approach_threshold:
+            self.get_logger().info('Reached barrel! Initiating pickup...')
             self.state = State.PICKING_UP
             return
         
-        # Check for walls while approaching
+        # Check for walls
         if self.front_distance < self.wall_stop_distance:
-            self.get_logger().warn('Wall detected while approaching barrel')
             self.state = State.AVOIDING_WALL
             return
         
-        # Align with barrel using camera
-        if self.barrel_center_x is not None:
-            image_center = 320  # Assuming 640px wide image
-            error = (self.barrel_center_x - image_center) / image_center
-            
-            # Move towards barrel while aligning
-            twist.linear.x = self.linear_speed * 0.5  # Slower approach
-            twist.angular.z = -error * 0.5  # Proportional control
-        else:
-            # Lost visual, creep forward slowly
-            twist.linear.x = 0.1
-    
-    def avoid_wall(self, twist):
-        """Avoid walls by stopping and rotating"""
-        # Stop first
-        twist.linear.x = 0.0
-        
-        # Decide which way to turn based on available space
-        if self.left_distance > self.right_distance:
-            # More space on left, turn left
-            self.get_logger().info(f'Turning LEFT (left:{self.left_distance:.2f}m > right:{self.right_distance:.2f}m)')
-            twist.angular.z = self.angular_speed
-        else:
-            # More space on right, turn right
-            self.get_logger().info(f'Turning RIGHT (right:{self.right_distance:.2f}m > left:{self.left_distance:.2f}m)')
-            twist.angular.z = -self.angular_speed
-        
-        # Check if we've cleared the wall
-        if self.front_distance > self.wall_stop_distance * 1.5:
-            self.get_logger().info('Wall cleared! Returning to exploration')
-            self.state = State.EXPLORING
+        # Align and approach
+        error = self.target_barrel.x / 320.0  # Normalize by image width
+        twist.linear.x = self.approach_speed
+        twist.angular.z = -error * 0.8  # Proportional control
     
     def pickup_barrel(self, twist):
-        """Execute barrel pickup procedure"""
-        # Stop movement
+        """Pick up barrel using service"""
         twist.linear.x = 0.0
         twist.angular.z = 0.0
         
-        self.get_logger().info(f'Picking up {self.detected_barrel} barrel')
+        # Call pickup service
+        request = ItemRequest.Request()
+        request.robot_id = self.robot_id
         
-        # TODO: Add actual pickup service call here
-        # For now, simulate pickup delay
-        # After pickup, return to exploration
-        self.state = State.EXPLORING
-        self.detected_barrel = None
+        if self.pickup_client.wait_for_service(timeout_sec=1.0):
+            future = self.pickup_client.call_async(request)
+            future.add_done_callback(self.pickup_response_callback)
+        else:
+            self.get_logger().error('Pickup service not available')
+            self.state = State.EXPLORING
     
-    def navigate_to_goal(self, x, y, theta=0.0):
-        """Send navigation goal to Nav2"""
-        goal_msg = NavigateToPose.Goal()
-        goal_msg.pose.header.frame_id = 'map'
-        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+    def pickup_response_callback(self, future):
+        """Handle pickup service response"""
+        try:
+            response = future.result()
+            if response.success:
+                self.carrying_barrel = True
+                self.barrel_color = self.target_barrel.colour if self.target_barrel else 'unknown'
+                self.is_contaminated = (self.barrel_color.lower() == 'red')
+                
+                self.barrels_collected += 1
+                self.get_logger().info(f'✅ Picked up {self.barrel_color} barrel!')
+                self.get_logger().info(f'Contaminated: {self.is_contaminated}')
+                self.get_logger().info(f'Total collected: {self.barrels_collected}')
+                
+                self.target_barrel = None
+                self.state = State.CARRYING_TO_ZONE
+            else:
+                self.get_logger().warn(f'Failed to pick up barrel: {response.message}')
+                self.state = State.EXPLORING
+        except Exception as e:
+            self.get_logger().error(f'Pickup service call failed: {e}')
+            self.state = State.EXPLORING
+    
+    def carry_to_zone(self, twist):
+        """Search for green collection zone while carrying barrel"""
+        # Check for wall
+        if self.front_distance < self.wall_stop_distance:
+            self.state = State.AVOIDING_WALL
+            return
         
-        goal_msg.pose.pose.position.x = x
-        goal_msg.pose.pose.position.y = y
-        goal_msg.pose.pose.position.z = 0.0
+        # Look for GREEN zones
+        green_zones = [z for z in self.visible_zones if z.colour.lower() == 'green']
         
-        # Convert theta to quaternion
-        goal_msg.pose.pose.orientation.z = math.sin(theta / 2)
-        goal_msg.pose.pose.orientation.w = math.cos(theta / 2)
+        if len(green_zones) > 0:
+            self.target_zone = min(green_zones, key=lambda z: abs(z.x))
+            self.get_logger().info(f'Green zone detected! x={self.target_zone.x:.2f}')
+            self.state = State.APPROACHING_ZONE
+            return
         
-        self.get_logger().info(f'Sending goal: x={x}, y={y}, theta={theta}')
-        self.nav_client.wait_for_server()
-        self.nav_client.send_goal_async(goal_msg)
+        # Continue searching
+        twist.linear.x = self.linear_speed * 0.8  # Slower while carrying
+        twist.angular.z = 0.1  # Gentle turn to scan area
+    
+    def approach_zone(self, twist):
+        """Approach green collection zone"""
+        # Look for green zones
+        green_zones = [z for z in self.visible_zones if z.colour.lower() == 'green']
+        
+        if len(green_zones) == 0:
+            self.get_logger().warn('Lost sight of zone')
+            self.state = State.CARRYING_TO_ZONE
+            return
+        
+        self.target_zone = min(green_zones, key=lambda z: abs(z.x))
+        
+        # Check if close enough to deposit
+        if self.front_distance < self.zone_approach_threshold or self.target_zone.size > 15000:
+            self.get_logger().info('Reached zone! Depositing barrel...')
+            self.state = State.DEPOSITING
+            return
+        
+        # Check for walls
+        if self.front_distance < self.wall_stop_distance:
+            self.state = State.AVOIDING_WALL
+            return
+        
+        # Align and approach
+        error = self.target_zone.x / 320.0
+        twist.linear.x = self.approach_speed
+        twist.angular.z = -error * 0.6
+    
+    def deposit_barrel(self, twist):
+        """Deposit barrel in zone"""
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        
+        # Call offload service
+        request = ItemRequest.Request()
+        request.robot_id = self.robot_id
+        
+        if self.offload_client.wait_for_service(timeout_sec=1.0):
+            future = self.offload_client.call_async(request)
+            future.add_done_callback(self.offload_response_callback)
+        else:
+            self.get_logger().error('Offload service not available')
+            self.carrying_barrel = False
+            self.state = State.EXPLORING
+    
+    def offload_response_callback(self, future):
+        """Handle offload service response"""
+        try:
+            response = future.result()
+            if response.success:
+                self.barrels_deposited += 1
+                self.get_logger().info(f'✅ Deposited {self.barrel_color} barrel successfully!')
+                self.get_logger().info(f'Total deposited: {self.barrels_deposited}')
+                
+                # Check if need decontamination
+                if self.is_contaminated:
+                    self.get_logger().warn('⚠️  Robot contaminated! Seeking decontamination...')
+                    self.state = State.NEEDS_DECONTAMINATION
+                else:
+                    self.carrying_barrel = False
+                    self.barrel_color = None
+                    self.state = State.EXPLORING
+            else:
+                self.get_logger().warn(f'Failed to deposit: {response.message}')
+                self.state = State.CARRYING_TO_ZONE
+        except Exception as e:
+            self.get_logger().error(f'Offload service call failed: {e}')
+            self.state = State.CARRYING_TO_ZONE
+    
+    def seek_decontamination(self, twist):
+        """Search for cyan decontamination zone"""
+        # Look for CYAN zones
+        cyan_zones = [z for z in self.visible_zones if z.colour.lower() == 'cyan']
+        
+        if len(cyan_zones) > 0:
+            self.target_zone = min(cyan_zones, key=lambda z: abs(z.x))
+            self.get_logger().info(f'Cyan decon zone found! x={self.target_zone.x:.2f}')
+            self.state = State.APPROACHING_DECON
+            return
+        
+        # Continue searching
+        twist.linear.x = self.linear_speed
+        twist.angular.z = 0.2  # Turn to scan
+    
+    def approach_decon(self, twist):
+        """Approach cyan decontamination zone"""
+        # Look for cyan zones
+        cyan_zones = [z for z in self.visible_zones if z.colour.lower() == 'cyan']
+        
+        if len(cyan_zones) == 0:
+            self.get_logger().warn('Lost sight of decon zone')
+            self.state = State.NEEDS_DECONTAMINATION
+            return
+        
+        self.target_zone = min(cyan_zones, key=lambda z: abs(z.x))
+        
+        # Check if in zone
+        if self.front_distance < self.decon_approach_threshold or self.target_zone.size > 15000:
+            self.get_logger().info('In decon zone! Decontaminating...')
+            self.state = State.DECONTAMINATING
+            return
+        
+        # Align and approach
+        error = self.target_zone.x / 320.0
+        twist.linear.x = self.approach_speed
+        twist.angular.z = -error * 0.6
+    
+    def decontaminate(self, twist):
+        """Call decontamination service"""
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
+        
+        request = ItemRequest.Request()
+        request.robot_id = self.robot_id
+        
+        if self.decon_client.wait_for_service(timeout_sec=1.0):
+            future = self.decon_client.call_async(request)
+            future.add_done_callback(self.decon_response_callback)
+        else:
+            self.get_logger().error('Decontamination service not available')
+            self.is_contaminated = False
+            self.carrying_barrel = False
+            self.state = State.EXPLORING
+    
+    def decon_response_callback(self, future):
+        """Handle decontamination response"""
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info('✅ Decontamination successful!')
+                self.is_contaminated = False
+                self.carrying_barrel = False
+                self.barrel_color = None
+                self.state = State.EXPLORING
+            else:
+                self.get_logger().warn(f'Decontamination failed: {response.message}')
+                self.state = State.NEEDS_DECONTAMINATION
+        except Exception as e:
+            self.get_logger().error(f'Decontamination service failed: {e}')
+            self.state = State.NEEDS_DECONTAMINATION
+    
+    def avoid_wall(self, twist):
+        """Avoid walls by stopping and rotating"""
+        twist.linear.x = 0.0
+        
+        # Decide rotation direction based on space
+        if self.left_distance > self.right_distance:
+            self.get_logger().info(f'Turning LEFT (L:{self.left_distance:.2f}m > R:{self.right_distance:.2f}m)')
+            twist.angular.z = self.angular_speed
+        else:
+            self.get_logger().info(f'Turning RIGHT (R:{self.right_distance:.2f}m > L:{self.left_distance:.2f}m)')
+            twist.angular.z = -self.angular_speed
+        
+        # Check if cleared
+        if self.front_distance > self.wall_stop_distance * 1.5:
+            self.get_logger().info('Wall cleared!')
+            if self.carrying_barrel:
+                self.state = State.CARRYING_TO_ZONE
+            else:
+                self.state = State.EXPLORING
 
 def main(args=None):
     rclpy.init(args=args)
