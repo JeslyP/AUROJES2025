@@ -1,385 +1,252 @@
 import sys
-from enum import Enum, auto
-from typing import Optional
-
 import rclpy
+import random
+import math
 from rclpy.node import Node
-from rclpy.signals import SignalHandlerOptions
-from rclpy.executors import ExternalShutdownException
-
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from geometry_msgs.msg import Twist
-
-from assessment_interfaces.msg import BarrelList, ZoneList, BarrelHolders, RadiationList
+from sensor_msgs.msg import LaserScan
 from auro_interfaces.srv import ItemRequest
+from assessment_interfaces.msg import BarrelList, ZoneList, Barrel, Zone, RadiationList
 
-
-class ControllerState(Enum):
-    SEARCH_BARREL = auto()
-    APPROACH_BARREL = auto()
-    PICKING_UP = auto()
-    SEARCH_GREEN_ZONE = auto()
-    APPROACH_GREEN_ZONE = auto()
-    OFFLOADING = auto()
-    SEARCH_CYAN_ZONE = auto()
-    APPROACH_CYAN_ZONE = auto()
-    DECONTAMINATING = auto()
+# --- State Definitions ---
+STATE_SEARCH_BARREL = 0
+STATE_APPROACH_BARREL = 1
+STATE_COLLECT_BARREL = 2
+STATE_SEARCH_ZONE = 3
+STATE_APPROACH_ZONE = 4
+STATE_DEPOSIT_BARREL = 5
+STATE_SEARCH_DECON = 6
+STATE_APPROACH_DECON = 7
+STATE_DECONTAMINATE = 8
 
 class RobotController(Node):
 
     def __init__(self):
         super().__init__('robot_controller')
 
-        self.declare_parameter('x', 0.0)
-        self.declare_parameter('y', 0.0)
-        self.declare_parameter('yaw', 0.0)
-        # Autonomy defaults to on; set to false to keep manual-only.
-        self.autonomy_enabled = self.declare_parameter('autonomy_enabled', True).get_parameter_value().bool_value
+        # --- Parameters ---
+        self.declare_parameter('robot_id', 'robot1')
+        ns = self.get_namespace().strip('/')
+        self.robot_id = ns if ns else self.get_parameter('robot_id').value
+        self.get_logger().info(f"Controller Started for {self.robot_id}")
 
-        self.initial_x = self.get_parameter('x').get_parameter_value().double_value
-        self.initial_y = self.get_parameter('y').get_parameter_value().double_value
-        self.initial_yaw = self.get_parameter('yaw').get_parameter_value().double_value
+        # --- State & Thresholds ---
+        self.state = STATE_SEARCH_BARREL
+        self.held_item = None
+        self.radiation_level = 0
+        self.radiation_limit = 40       # Decontaminate if rads > 40
+        self.pixel_dist_close = 7500.0  # Size of barrel when close
+        self.pixel_dist_zone = 16000.0  # Size of zone when close
+        self.obs_dist = 0.5             # Meters to obstacle
 
-        namespace = (self.get_namespace() or '').strip()
-        self.robot_id = namespace.lstrip('/') if namespace else 'robot1'
-
+        # --- Communication ---
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
+        
+        qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
+        self.create_subscription(BarrelList, 'barrels', self.cb_barrels, qos)
+        self.create_subscription(ZoneList, 'zones', self.cb_zones, qos)
+        self.create_subscription(LaserScan, 'scan', self.cb_scan, qos)
+        self.create_subscription(RadiationList, '/radiation_levels', self.cb_rads, qos)
 
-        self.last_barrels: list = []
-        self.last_zones: list = []
-        self.holding_colour: Optional[int] = None
-        self.radiation_level: int = 0
+        self.srv_pickup = self.create_client(ItemRequest, '/pick_up_item')
+        self.srv_offload = self.create_client(ItemRequest, '/offload_item')
+        self.srv_decon = self.create_client(ItemRequest, '/decontaminate')
 
-        # === TESTING: Teleop mode for manual robot control ===
-        # Remove this section when done testing movement.
-        self.teleop_twist: Optional[Twist] = None
-        self.last_teleop_time = self.get_clock().now()
-        self.create_subscription(Twist, 'teleop_twist', self._teleop_cb, 10)
-        # === END TESTING ===
+        # --- Data Cache ---
+        self.barrels = []
+        self.zones = []
+        self.scan_front = []
 
-        self.create_subscription(BarrelList, 'barrels', self._barrels_cb, 10)
-        self.create_subscription(ZoneList, 'zones', self._zones_cb, 10)
-        self.create_subscription(BarrelHolders, '/barrel_holders', self._holders_cb, 10)
-        self.create_subscription(RadiationList, '/radiation_levels', self._radiation_cb, 10)
+        # --- Anti-stuck / escape control ---
+        self.escape_end_time = None
+        self.turn_dir = 1  # toggles between left/right when escaping
 
-        self.pickup_client = self.create_client(ItemRequest, '/pick_up_item')
-        self.offload_client = self.create_client(ItemRequest, '/offload_item')
-        self.decontaminate_client = self.create_client(ItemRequest, '/decontaminate')
+        # --- Startup straight-line phase ---
+        self.declare_parameter('start_drive_seconds', 3.0)
+        try:
+            start_sec = float(self.get_parameter('start_drive_seconds').value)
+        except Exception:
+            start_sec = 3.0
+        self.start_drive_end_time = self.get_clock().now() + rclpy.time.Duration(seconds=start_sec)
 
-        self.state = ControllerState.SEARCH_BARREL
-        self.pending_future = None
-        self.pending_action: Optional[ControllerState] = None
-        self.last_service_call_time = self.get_clock().now()
+        # --- Loop ---
+        self.timer = self.create_timer(0.1, self.control_loop)
 
-        self._align_start_time = None
+    def cb_barrels(self, msg): self.barrels = msg.data
+    def cb_zones(self, msg): self.zones = msg.data
+    def cb_scan(self, msg): 
+        # Cache front 60 degrees of scan
+        if not msg.ranges: return
+        n = len(msg.ranges)
+        w = 30 # degrees side
+        self.scan_front = msg.ranges[-w:] + msg.ranges[:w]
 
-        # Search / exploration behaviour state
-        self._search_start_time = None
+    def front_min(self) -> float:
+        vals = [r for r in self.scan_front if r > 0.01]
+        return min(vals) if vals else float('inf')
 
-        self.first_time = True
-        self.timer_period = 0.1 # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(self.timer_period, self.control_loop)
-
-    def _barrels_cb(self, msg: BarrelList):
-        self.last_barrels = list(msg.data)
-
-    def _zones_cb(self, msg: ZoneList):
-        self.last_zones = list(msg.data)
-
-    def _holders_cb(self, msg: BarrelHolders):
-        holding = None
-        for holder in msg.data:
-            if holder.robot_id == self.robot_id:
-                holding = holder.colour
-                break
-        self.holding_colour = holding
-
-    def _radiation_cb(self, msg: RadiationList):
-        level = 0
+    def cb_rads(self, msg):
         for r in msg.data:
             if r.robot_id == self.robot_id:
-                level = int(r.level)
+                self.radiation_level = r.level
                 break
-        self.radiation_level = level
 
-    # === TESTING: Teleop callback ===
-    # Remove this method when done testing movement.
-    def _teleop_cb(self, msg: Twist):
-        self.teleop_twist = msg
-        self.last_teleop_time = self.get_clock().now()
-    # === END TESTING ===
+    def get_target(self, items, type_filter=None):
+        best = None
+        max_sz = -1.0
+        for i in items:
+            if type_filter is not None:
+                # Barrel uses 'colour', Zone uses 'zone'
+                val = getattr(i, 'colour', getattr(i, 'zone', -1))
+                if val != type_filter: continue
+            if i.size > max_sz:
+                max_sz = i.size
+                best = i
+        return best
 
-    def _publish_twist(self, linear_x: float, angular_z: float):
-        msg = Twist()
-        msg.linear.x = float(linear_x)
-        msg.angular.z = float(angular_z)
-        try:
-            self.cmd_vel_pub.publish(msg)
-        except Exception:
-            # During shutdown, the underlying rcl context may already be invalid.
-            pass
+    def check_safety(self):
+        # Return True if obstacle imminent
+        if not self.scan_front: return False
+        # Filter 0.0 values (sensor errors) and check threshold
+        return any(0.01 < r < self.obs_dist for r in self.scan_front)
 
-    def _stop(self):
-        self._publish_twist(0.0, 0.0)
-
-    def _choose_barrel(self):
-        if not self.last_barrels:
-            return None
-        blue = [b for b in self.last_barrels if int(b.colour) == 1]
-        red = [b for b in self.last_barrels if int(b.colour) == 0]
-        candidates = blue if blue else red
-        return max(candidates, key=lambda b: float(b.size), default=None)
-
-    def _choose_zone(self, zone_type: int):
-        zones = [z for z in self.last_zones if int(z.zone) == int(zone_type)]
-        if not zones:
-            return None
-        return max(zones, key=lambda z: float(z.size), default=None)
-
-    def _drive_to_target(self, x_err: float, size: float):
-        x_scale = 320.0
-        k_ang = 1.2
-        k_lin = 0.18
-
-        ang = -k_ang * (float(x_err) / x_scale)
-        ang = max(min(ang, 0.8), -0.8)
-
-        # Prefer driving in an arc rather than turning in place forever.
-        # When the target is far off-centre we still creep forward so the robot
-        # actually explores new space and the vision target can re-enter view.
-        forward_scale = max(0.0, 1.0 - min(abs(float(x_err)) / 260.0, 1.0))
-        lin = k_lin * forward_scale
-
-        # Add a small minimum speed for distant/small targets.
-        if float(size) < 0.18:
-            lin = max(lin, 0.06)
-        elif float(size) < 0.26:
-            lin = max(lin, 0.03)
-
-        if float(size) > 0.35:
-            lin *= 0.4
-
-        self._publish_twist(lin, ang)
-
-    def _wander_search(self):
-        # Simple exploration: rotate to scan, then drive forward.
-        if self._search_start_time is None:
-            self._search_start_time = self.get_clock().now()
-
-        elapsed = (self.get_clock().now() - self._search_start_time).nanoseconds / 1e9
-        rotate_time = 3.0
-        forward_time = 2.5
-        cycle = rotate_time + forward_time
-        phase = elapsed % cycle
-
-        if phase < rotate_time:
-            self._publish_twist(0.0, 0.55)
-        else:
-            self._publish_twist(0.14, 0.0)
-
-    def _can_call_service(self) -> bool:
-        now = self.get_clock().now()
-        if (now - self.last_service_call_time).nanoseconds < int(1e9):
-            return False
-        self.last_service_call_time = now
-        return True
-
-    def _call_item_service(self, client, action_state: ControllerState):
-        if not self._can_call_service():
-            return False
-        if not client.service_is_ready():
-            client.wait_for_service(timeout_sec=0.0)
-            return False
-
-        req = ItemRequest.Request()
-        req.robot_id = self.robot_id
-        self.pending_future = client.call_async(req)
-        self.pending_action = action_state
-        return True
+    def call_srv(self, client):
+        if client.wait_for_service(0.5):
+            req = ItemRequest.Request()
+            req.robot_id = self.robot_id
+            client.call_async(req)
 
     def control_loop(self):
-
-        if self.first_time:
-            self.get_logger().info(f"Initial pose - x: {self.initial_x}, y: {self.initial_y}, yaw: {self.initial_yaw}. Ready to go.")
-            self.get_logger().info(f"Robot id: {self.robot_id}")
-            self.first_time = False
-
-        # === TESTING: Check for active teleop input ===
-        # Remove this section when done testing movement.
-        now = self.get_clock().now()
-        teleop_active = (self.teleop_twist is not None and 
-                         (now - self.last_teleop_time).nanoseconds < int(0.5e9))  # 0.5s timeout
+        twist = Twist()
         
-        if teleop_active:
-            # Use teleop input instead of autonomous control
-            self._publish_twist(self.teleop_twist.linear.x, self.teleop_twist.angular.z)
-            return
-        if not self.autonomy_enabled:
-            # Autonomous mode disabled; hold position unless teleop input is active.
-            self._stop()
-            return
-        # === END TESTING ===
+        # --- High Priority: Decontamination Trigger ---
+        if self.radiation_level >= self.radiation_limit:
+            # If not already dealing with decon, switch state
+            if self.state < STATE_SEARCH_DECON:
+                self.get_logger().warn(f"Radiation {self.radiation_level}! Seeking Decon.")
+                self.state = STATE_SEARCH_DECON
 
-        # Handle in-flight service call
-        if self.pending_future is not None:
-            if self.pending_future.done():
-                try:
-                    resp = self.pending_future.result()
-                    if resp is not None:
-                        if resp.success:
-                            self.get_logger().info(resp.message)
-                        else:
-                            self.get_logger().warn(resp.message)
-                except Exception as e:
-                    self.get_logger().warn(f"Service call failed: {e}")
+        # --- Timed Escape (anti-stuck) ---
+        if self.escape_end_time is not None:
+            if self.get_clock().now() < self.escape_end_time:
+                twist.linear.x = -0.12
+                twist.angular.z = 0.6 * self.turn_dir
+                self.cmd_vel_pub.publish(twist)
+                return
+            self.escape_end_time = None
 
-                finished_action = self.pending_action
-                self.pending_future = None
-                self.pending_action = None
+        # --- High Priority: Safety Override ---
+        # If obstacle very close, initiate escape (unless strictly interacting)
+        interacting = self.state in [STATE_COLLECT_BARREL, STATE_DEPOSIT_BARREL, STATE_DECONTAMINATE]
+        if not interacting:
+            fm = self.front_min()
+            if fm < 0.35:
+                self.turn_dir *= -1
+                self.escape_end_time = self.get_clock().now() + rclpy.time.Duration(seconds=1.4)
+                twist.linear.x = -0.12
+                twist.angular.z = 0.6 * self.turn_dir
+                self.cmd_vel_pub.publish(twist)
+                return
 
-                if finished_action == ControllerState.PICKING_UP:
-                    # If it didn't attach, we will still see holding_colour=None
-                    self.state = ControllerState.SEARCH_GREEN_ZONE if self.holding_colour is not None else ControllerState.SEARCH_BARREL
-                elif finished_action == ControllerState.OFFLOADING:
-                    # After offload, decide whether to decontaminate
-                    if self.radiation_level > 0:
-                        self.state = ControllerState.SEARCH_CYAN_ZONE
-                    else:
-                        self.state = ControllerState.SEARCH_BARREL
-                elif finished_action == ControllerState.DECONTAMINATING:
-                    self.state = ControllerState.SEARCH_BARREL
+        # --- Startup straight-line drive ---
+        if self.start_drive_end_time is not None:
+            if self.get_clock().now() < self.start_drive_end_time:
+                twist.linear.x = 0.22
+                twist.angular.z = 0.0
+                self.cmd_vel_pub.publish(twist)
+                return
             else:
-                self._stop()
-            return
+                self.start_drive_end_time = None
 
-        # If something is attached, focus on delivery
-        if self.holding_colour is not None and self.state in (ControllerState.SEARCH_BARREL, ControllerState.APPROACH_BARREL):
-            self.state = ControllerState.SEARCH_GREEN_ZONE
+        # --- FSM Logic ---
+        if self.state == STATE_SEARCH_BARREL:
+            target = self.get_target(self.barrels) # Any barrel
+            if target:
+                self.state = STATE_APPROACH_BARREL
+            else:
+                twist.linear.x = 0.15  # Move forward while searching
+                twist.angular.z = 0.3   # Gentle turn to scan
 
-        # --- State machine ---
-        if self.state == ControllerState.SEARCH_BARREL:
-            target = self._choose_barrel()
-            if target is None:
-                self._wander_search()
+        elif self.state == STATE_APPROACH_BARREL:
+            target = self.get_target(self.barrels)
+            if not target: 
+                self.state = STATE_SEARCH_BARREL
                 return
-            self._search_start_time = None
-            self.state = ControllerState.APPROACH_BARREL
+            # Visual servoing with clamped angular rate and minimum forward speed
+            twist.linear.x = 0.20
+            twist.angular.z = max(min(0.002 * target.x, 0.4), -0.4)
+            
+            if target.size > self.pixel_dist_close:
+                twist.linear.x = 0.0
+                twist.angular.z = 0.0
+                self.held_item = target.colour
+                self.state = STATE_COLLECT_BARREL
 
-        if self.state == ControllerState.APPROACH_BARREL:
-            target = self._choose_barrel()
-            if target is None:
-                self.state = ControllerState.SEARCH_BARREL
+        elif self.state == STATE_COLLECT_BARREL:
+            self.call_srv(self.srv_pickup)
+            self.state = STATE_SEARCH_ZONE
+
+        elif self.state == STATE_SEARCH_ZONE:
+            target = self.get_target(self.zones, Zone.ZONE_GREEN)
+            if target:
+                self.state = STATE_APPROACH_ZONE
+            else:
+                twist.linear.x = 0.12  # Move forward while searching
+                twist.angular.z = -0.35 # Turn opposite direction from barrel search
+
+        elif self.state == STATE_APPROACH_ZONE:
+            target = self.get_target(self.zones, Zone.ZONE_GREEN)
+            if not target:
+                self.state = STATE_SEARCH_ZONE
                 return
+            twist.linear.x = 0.18
+            twist.angular.z = max(min(0.002 * target.x, 0.4), -0.4)
+            
+            if target.size > self.pixel_dist_zone:
+                self.state = STATE_DEPOSIT_BARREL
 
-            x_err = float(target.x)
-            size = float(target.size)
+        elif self.state == STATE_DEPOSIT_BARREL:
+            twist.linear.x = 0.0
+            self.call_srv(self.srv_offload)
+            self.held_item = None
+            self.state = STATE_SEARCH_BARREL
 
-            if abs(x_err) < 25.0 and size > 0.30:
-                # Pickup expects the barrel behind the robot. We drive forward past the
-                # barrel, stop briefly, then request pickup.
-                if self._align_start_time is None:
-                    self._align_start_time = self.get_clock().now()
+        elif self.state == STATE_SEARCH_DECON:
+            target = self.get_target(self.zones, Zone.ZONE_CYAN)
+            if target:
+                self.state = STATE_APPROACH_DECON
+            else:
+                twist.linear.x = 0.12
+                twist.angular.z = 0.4  # Moderate turn rate
 
-                elapsed = (self.get_clock().now() - self._align_start_time).nanoseconds / 1e9
-                if elapsed < 1.6:
-                    self._publish_twist(0.16, 0.0)  # drive forward to put barrel behind
-                    return
-                if elapsed < 1.9:
-                    self._stop()
-                    return
-
-                self._align_start_time = None
-                self._stop()
-                if self._call_item_service(self.pickup_client, ControllerState.PICKING_UP):
-                    self.state = ControllerState.PICKING_UP
+        elif self.state == STATE_APPROACH_DECON:
+            target = self.get_target(self.zones, Zone.ZONE_CYAN)
+            if not target:
+                self.state = STATE_SEARCH_DECON
                 return
+            twist.linear.x = 0.18
+            twist.angular.z = max(min(0.002 * target.x, 0.4), -0.4)
+            
+            if target.size > self.pixel_dist_zone:
+                self.state = STATE_DECONTAMINATE
 
-            self._drive_to_target(x_err, size)
-            return
+        elif self.state == STATE_DECONTAMINATE:
+            twist.linear.x = 0.0
+            self.call_srv(self.srv_decon)
+            if self.radiation_level < 5:
+                self.get_logger().info("Clean. Resuming.")
+                self.state = STATE_SEARCH_ZONE if self.held_item else STATE_SEARCH_BARREL
 
-        if self.state == ControllerState.SEARCH_GREEN_ZONE:
-            target = self._choose_zone(zone_type=1)  # ZONE_GREEN
-            if target is None:
-                self._wander_search()
-                return
-            self._search_start_time = None
-            self.state = ControllerState.APPROACH_GREEN_ZONE
-
-        if self.state == ControllerState.APPROACH_GREEN_ZONE:
-            target = self._choose_zone(zone_type=1)
-            if target is None:
-                self.state = ControllerState.SEARCH_GREEN_ZONE
-                return
-
-            x_err = float(target.x)
-            size = float(target.size)
-
-            if abs(x_err) < 30.0 and size > 0.28:
-                # Barrel is behind; drive forward slightly into the zone before offloading.
-                if self._align_start_time is None:
-                    self._align_start_time = self.get_clock().now()
-
-                elapsed = (self.get_clock().now() - self._align_start_time).nanoseconds / 1e9
-                if elapsed < 1.5:
-                    self._publish_twist(0.12, 0.0)
-                    return
-
-                self._align_start_time = None
-                self._stop()
-                if self._call_item_service(self.offload_client, ControllerState.OFFLOADING):
-                    self.state = ControllerState.OFFLOADING
-                return
-
-            self._drive_to_target(x_err, size)
-            return
-
-        if self.state == ControllerState.SEARCH_CYAN_ZONE:
-            target = self._choose_zone(zone_type=0)  # ZONE_CYAN
-            if target is None:
-                self._wander_search()
-                return
-            self._search_start_time = None
-            self.state = ControllerState.APPROACH_CYAN_ZONE
-
-        if self.state == ControllerState.APPROACH_CYAN_ZONE:
-            target = self._choose_zone(zone_type=0)
-            if target is None:
-                self.state = ControllerState.SEARCH_CYAN_ZONE
-                return
-
-            x_err = float(target.x)
-            size = float(target.size)
-
-            if abs(x_err) < 30.0 and size > 0.28:
-                self._stop()
-                if self._call_item_service(self.decontaminate_client, ControllerState.DECONTAMINATING):
-                    self.state = ControllerState.DECONTAMINATING
-                return
-
-            self._drive_to_target(x_err, size)
-            return
-
-
-    def destroy_node(self):
-        self._stop()
-        super().destroy_node()
-
+        self.cmd_vel_pub.publish(twist)
 
 def main(args=None):
-
-    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.ALL)
-
+    rclpy.init(args=args)
     node = RobotController()
-
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    except ExternalShutdownException:
-        pass
+    try: rclpy.spin(node)
+    except KeyboardInterrupt: pass
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
 
-
-if __name__ == '__main__':
-    main()
+if __name__ == '__main__': main()

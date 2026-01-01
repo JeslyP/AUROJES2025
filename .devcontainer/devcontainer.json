@@ -26,43 +26,57 @@
   },
   "customizations": {
     "auro": {
-      "scenarios": [
-        {
-          "name": "3 Robots (GUI)",
-          "description": "Three robots, Gazebo GUI enabled, RViz disabled.",
-          "parameters": {
-            "num_robots": 3,
-            "use_rviz": "false",
-            "barrels": "true",
-            "wait_for_barrels": "true",
-            "headless": "false",
-            "limit_real_time_factor": "true"
-          }
-        },
-        {
-          "name": "3 Robots (Headless)",
-          "description": "Three robots, headless, runs faster than real-time, RViz disabled.",
-          "parameters": {
-            "num_robots": 3,
-            "use_rviz": "false",
-            "barrels": "true",
-            "wait_for_barrels": "true",
-            "headless": "true",
-            "limit_real_time_factor": "false"
-          }
-        },
-        {
-          "name": "1 Robot (GUI)",
-          "description": "Single robot, Gazebo GUI enabled, RViz disabled.",
-          "parameters": {
-            "num_robots": 1,
-            "use_rviz": "false",
-            "barrels": "true",
-            "wait_for_barrels": "true",
-            "headless": "false",
-            "limit_real_time_factor": "true"
-          }
-        }
+      "scenarios" : [
+            {
+                "name": "Scenario 1 - Baseline",
+                "description": "Single robot, no obstacles, no noise. Validates basic collection.",
+                "parameters": {
+                    "use_rviz": "true",
+                    "num_robots": 1,
+                    "sensor_noise": "false",
+                    "obstacles": "false"
+                }
+            },
+            {
+                "name": "Scenario 2 - Multi-Robot",
+                "description": "Two robots. Validates multi-agent coordination.",
+                "parameters": {
+                    "use_rviz": "true",
+                    "num_robots": 2,
+                    "sensor_noise": "false",
+                    "obstacles": "false"
+                }
+            },
+            {
+                "name": "Scenario 3 - Obstacles",
+                "description": "Single robot with obstacles. Validates collision avoidance.",
+                "parameters": {
+                    "use_rviz": "true",
+                    "num_robots": 1,
+                    "sensor_noise": "false",
+                    "obstacles": "true"
+                }
+            },
+            {
+                "name": "Scenario 4 - High Noise",
+                "description": "Single robot with sensor noise. Validates robustness of visual servoing.",
+                "parameters": {
+                    "use_rviz": "true",
+                    "num_robots": 1,
+                    "sensor_noise": "true",
+                    "obstacles": "false"
+                }
+            },
+            {
+                "name": "Scenario 5 - Stress Test",
+                "description": "Two robots, obstacles, and noise. Full system validation.",
+                "parameters": {
+                    "use_rviz": "true",
+                    "num_robots": 2,
+                    "sensor_noise": "true",
+                    "obstacles": "true"
+                }
+            }
       ]
     }
   }
