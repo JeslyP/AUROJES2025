@@ -272,8 +272,31 @@ class RobotController(Node):
     # ================================================================
 
     def searching(self):
-        """SEARCHING state: Look for barrels."""
-        pass
+         """SEARCHING state: Look for barrels by rotating."""
+        
+        # Check if we see any barrels
+        if len(self.barrels) > 0:
+            # Found barrel(s)! Pick the largest one (closest/most visible)
+            largest_barrel = max(self.barrels, key=lambda b: b.size)
+            
+            self.target_barrel = largest_barrel
+            self.get_logger().info(
+                f"Found barrel! Colour: {largest_barrel.colour}, "
+                f"Size: {largest_barrel.size:.2f}, "
+                f"Offset: x={largest_barrel.x:.2f}, y={largest_barrel.y:.2f}"
+            )
+            
+            # Stop rotating
+            self.stop_robot()
+            
+            # Switch to APPROACHING state
+            self.state = State.APPROACHING
+            return
+        
+        # No barrel found - rotate to search
+        twist = Twist()
+        twist.angular.z = 0.5  # Rotate at 0.5 rad/s (about 30 deg/s)
+        self.cmd_vel_publisher.publish(twist)
 
     def approaching(self):
         """APPROACHING state: Navigate to barrel."""
