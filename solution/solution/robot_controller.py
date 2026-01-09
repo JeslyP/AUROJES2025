@@ -166,7 +166,7 @@ class RobotController(Node):
             10
         )
 
-        # Flag to track if initial pose has been set
+        # Flag to publish initial pose only once
         self.initial_pose_set = False
 
         # ============================================================
@@ -225,6 +225,9 @@ class RobotController(Node):
     def barrel_callback(self, msg):
         """Callback for barrel detection from camera."""
         self.barrels = msg.data
+        # Debug: log when barrels are detected
+        if len(self.barrels) > 0:
+            self.get_logger().info(f"Barrel callback: detected {len(self.barrels)} barrel(s)")
 
     def zone_callback(self, msg):
         """Callback for zone detection from camera."""
@@ -268,38 +271,74 @@ class RobotController(Node):
     # HELPER METHODS
     # ================================================================
 
-    def stop_robot(self):
-        """Stop the robot."""
-        twist = Twist()
-        self.cmd_vel_publisher.publish(twist)
-
-    def publish_initial_pose(self):
-        """Publish initial pose to AMCL for localization."""
-        if self.initial_pose_set:
-            return
-        
+    def set_initial_pose(self):
+        """Publish initial pose for AMCL."""
         msg = PoseWithCovarianceStamped()
-        msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
         
-        msg.pose.pose.position.x = self.initial_x
-        msg.pose.pose.position.y = self.initial_y
+        # Map coordinates (found by manually setting pose in RViz)
+        # The Gazebo spawn (0, -2) corresponds to map position (~0, 0)
+        # This offset exists because the map origin differs from Gazebo origin
+        map_x = 0.0
+        map_y = 0.0
+        map_yaw = self.initial_yaw  # Keep the yaw from launch file
+        
+        msg.pose.pose.position.x = map_x
+        msg.pose.pose.position.y = map_y
         msg.pose.pose.position.z = 0.0
         
         # Convert yaw to quaternion
         msg.pose.pose.orientation.x = 0.0
         msg.pose.pose.orientation.y = 0.0
-        msg.pose.pose.orientation.z = math.sin(self.initial_yaw / 2.0)
-        msg.pose.pose.orientation.w = math.cos(self.initial_yaw / 2.0)
+        msg.pose.pose.orientation.z = math.sin(map_yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(map_yaw / 2.0)
         
-        # Set covariance (small values = confident in position)
-        msg.pose.covariance[0] = 0.25  # x variance
-        msg.pose.covariance[7] = 0.25  # y variance
-        msg.pose.covariance[35] = 0.0685  # yaw variance
+        # Set covariance (small values = high confidence)
+        msg.pose.covariance = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891909122467]
         
         self.initial_pose_publisher.publish(msg)
-        self.initial_pose_set = True
-        self.get_logger().info(f"Published initial pose: x={self.initial_x}, y={self.initial_y}, yaw={self.initial_yaw}")
+        self.get_logger().info(f"Published initial pose: x={map_x}, y={map_y}, yaw={map_yaw}")
+        
+        # Republish a few times to ensure AMCL receives it
+        self._republish_count = 0
+        self._map_x = map_x
+        self._map_y = map_y
+        self._map_yaw = map_yaw
+        self.republish_timer = self.create_timer(0.5, self._republish_initial_pose)
+        
+    def _republish_initial_pose(self):
+        """Republish initial pose a few times to ensure AMCL gets it."""
+        self._republish_count += 1
+            
+        if self._republish_count <= 3:
+            msg = PoseWithCovarianceStamped()
+            msg.header.frame_id = 'map'
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.pose.pose.position.x = self._map_x
+            msg.pose.pose.position.y = self._map_y
+            msg.pose.pose.orientation.z = math.sin(self._map_yaw / 2.0)
+            msg.pose.pose.orientation.w = math.cos(self._map_yaw / 2.0)
+            msg.pose.covariance = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                   0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
+                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891909122467]
+            self.initial_pose_publisher.publish(msg)
+        else:
+            # Stop the timer after 3 republishes
+            self.republish_timer.cancel()
+
+    def stop_robot(self):
+        """Stop the robot."""
+        twist = Twist()
+        self.cmd_vel_publisher.publish(twist)
 
     def distance_to(self, x, y):
         """Calculate distance from robot to a point."""
@@ -369,8 +408,9 @@ class RobotController(Node):
         
         # Set initial pose for AMCL (only once)
         if not self.initial_pose_set:
-            self.publish_initial_pose()
-            return  # Wait for localization to initialize
+            self.set_initial_pose()
+            self.initial_pose_set = True
+            return  # Give AMCL time to process
         
         # Log state changes
         if self.state != self.previous_state:
