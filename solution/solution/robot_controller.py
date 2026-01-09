@@ -282,7 +282,8 @@ class RobotController(Node):
         # This offset exists because the map origin differs from Gazebo origin
         map_x = 0.0
         map_y = 0.0
-        map_yaw = self.initial_yaw  # Keep the yaw from launch file
+        # Adjust yaw by -90 degrees (subtract pi/2) to correct orientation
+        map_yaw = self.initial_yaw - (math.pi / 2.0)
         
         msg.pose.pose.position.x = map_x
         msg.pose.pose.position.y = map_y
@@ -376,8 +377,52 @@ class RobotController(Node):
         self.cmd_vel_publisher.publish(twist)
 
     def approaching(self):
-        """APPROACHING state: Navigate to barrel."""
-        pass
+        """APPROACHING state: Navigate to barrel using Nav2."""
+        
+        # Check if we still see barrels
+        if len(self.barrels) == 0:
+            # Lost sight of barrel - go back to searching
+            self.get_logger().warn("Lost sight of barrel, returning to SEARCHING")
+            self.target_barrel = None
+            self.state = State.SEARCHING
+            return
+        
+        # Update target to largest visible barrel
+        self.target_barrel = max(self.barrels, key=lambda b: b.size)
+        
+        # The barrel's x,y from camera is relative to robot
+        # x = forward distance, y = left/right offset
+        barrel_x = self.target_barrel.x  # Forward distance
+        barrel_y = self.target_barrel.y  # Left/right offset
+        barrel_size = self.target_barrel.size
+        
+        self.get_logger().info(f"Approaching barrel: x={barrel_x:.2f}, y={barrel_y:.2f}, size={barrel_size:.2f}")
+        
+        # If barrel is close enough, switch to POSITIONING
+        # Size indicates how close we are (bigger = closer)
+        if barrel_size > 100:  # Adjust threshold as needed
+            self.get_logger().info("Close enough to barrel, switching to POSITIONING")
+            self.stop_robot()
+            self.state = State.POSITIONING
+            return
+        
+        # Move towards the barrel using cmd_vel (simple approach)
+        twist = Twist()
+        
+        # Linear speed - move forward
+        twist.linear.x = 0.2  # Move forward at 0.2 m/s
+        
+        # Angular speed - turn towards barrel
+        # If barrel_y is positive, barrel is to the left, turn left (positive angular)
+        # If barrel_y is negative, barrel is to the right, turn right (negative angular)
+        angular_gain = 0.01  # Adjust for responsiveness
+        twist.angular.z = angular_gain * barrel_y
+        
+        # Clamp angular velocity
+        max_angular = 0.5
+        twist.angular.z = max(-max_angular, min(max_angular, twist.angular.z))
+        
+        self.cmd_vel_publisher.publish(twist)
 
     def positioning(self):
         """POSITIONING state: Maneuver barrel behind robot."""
