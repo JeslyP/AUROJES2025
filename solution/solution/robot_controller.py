@@ -76,6 +76,11 @@ class RobotController(Node):
         # Target tracking
         self.target_barrel = None   # Current barrel we're going for
 
+        # Control flags
+        self.ready = False          # Ready to start (after AMCL initialized)
+        self.confirmation_count = 0 # Counter for state confirmations
+        self.CONFIRMATION_THRESHOLD = 5  # Number of confirmations before state change
+
         # Known zone positions (from barrel_manager.py)
         # Green collection zones
         self.collection_zone_1 = {'x': 13.5, 'y': 9.4}
@@ -352,107 +357,181 @@ class RobotController(Node):
     # STATE METHODS (TODO: Implement these)
     # ================================================================
 
-    def searching(self):
-        """SEARCHING state: Look for barrels by rotating."""
+    def searching(self, twist):
+        """SEARCHING state: Look for barrels by rotating, then moving if none found."""
+        
+        # Initialize search tracking variables if not exists
+        if not hasattr(self, 'search_rotation_count'):
+            self.search_rotation_count = 0
+            self.search_phase = 'ROTATING'  # ROTATING or MOVING
+            self.move_distance = 0.0
         
         # Check if we see any barrels
         if len(self.barrels) > 0:
-            # Found barrel(s)! Pick the largest one (closest/most visible)
-            largest_barrel = max(self.barrels, key=lambda b: b.size)
+            # Found barrel(s)! Confirm detection
+            self.confirmation_count += 1
             
-            self.target_barrel = largest_barrel
-            self.get_logger().info(
-                f"Found barrel! Colour: {largest_barrel.colour}, "
-                f"Size: {largest_barrel.size:.2f}, "
-                f"Offset: x={largest_barrel.x:.2f}, y={largest_barrel.y:.2f}"
-            )
-            
-            # Stop rotating
-            self.stop_robot()
-            
-            # Switch to APPROACHING state
-            self.state = State.APPROACHING
+            if self.confirmation_count >= self.CONFIRMATION_THRESHOLD:
+                # Confirmed barrel detection
+                largest_barrel = max(self.barrels, key=lambda b: b.size)
+                self.target_barrel = largest_barrel
+                self.get_logger().info(
+                    f"Found barrel! Colour: {largest_barrel.colour}, "
+                    f"Size: {largest_barrel.size:.2f}, "
+                    f"Offset: x={largest_barrel.x:.2f}, y={largest_barrel.y:.2f}"
+                )
+                
+                # Reset search variables and switch state
+                twist.linear.x = 0.0
+                twist.angular.z = 0.0
+                self.confirmation_count = 0
+                self.search_rotation_count = 0
+                self.search_phase = 'ROTATING'
+                self.state = State.APPROACHING
+            else:
+                # Still confirming, slow down rotation
+                twist.linear.x = 0.0
+                twist.angular.z = 0.3
             return
         
-        # No barrel found - rotate to search
-        twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.5  # Rotate at 0.5 rad/s (about 30 deg/s)
+        # No barrel found - reset confirmation
+        self.confirmation_count = 0
         
-        # Publish velocity command
-        self.cmd_vel_publisher.publish(twist)
-        self.get_logger().info(
-            f"SEARCHING: Rotating (angular.z={twist.angular.z}), no barrels seen",
-            throttle_duration_sec=1.0
-        )
+        if self.search_phase == 'ROTATING':
+            # Rotate to scan for barrels
+            twist.linear.x = 0.0
+            twist.angular.z = 0.5  # Rotate at 0.5 rad/s
+            
+            # Count rotation cycles (roughly 12 seconds for full 360° at 0.5 rad/s)
+            self.search_rotation_count += 1
+            
+            # After roughly one full rotation (about 120 iterations at 10Hz), move to new spot
+            if self.search_rotation_count > 120:
+                self.get_logger().info("No barrels found, moving to new location")
+                self.search_phase = 'MOVING'
+                self.search_rotation_count = 0
+                self.move_distance = 0.0
+            
+            self.get_logger().info(
+                f"SEARCHING (ROTATING): count={self.search_rotation_count}",
+                throttle_duration_sec=2.0
+            )
+            
+        elif self.search_phase == 'MOVING':
+            # Move forward to a new location
+            twist.linear.x = 0.2  # Move forward
+            twist.angular.z = 0.0
+            
+            self.move_distance += twist.linear.x * self.timer_period  # Track distance
+            
+            # Check for obstacles using LiDAR (front)
+            if len(self.scan_data) > 0:
+                # Front scan (around index 0, which is directly ahead)
+                front_ranges = self.scan_data[0:30] + self.scan_data[-30:]
+                front_ranges = [r for r in front_ranges if r > 0.1]  # Filter invalid readings
+                
+                if len(front_ranges) > 0:
+                    min_front = min(front_ranges)
+                    
+                    if min_front < 0.5:  # Obstacle within 0.5m
+                        self.get_logger().info(f"Obstacle ahead ({min_front:.2f}m), turning")
+                        twist.linear.x = 0.0
+                        twist.angular.z = 0.5  # Turn to avoid
+            
+            # After moving ~2 meters, go back to rotating
+            if self.move_distance > 2.0:
+                self.get_logger().info("Moved to new location, scanning again")
+                self.search_phase = 'ROTATING'
+                self.move_distance = 0.0
+            
+            self.get_logger().info(
+                f"SEARCHING (MOVING): distance={self.move_distance:.2f}m",
+                throttle_duration_sec=2.0
+            )
 
-    def approaching(self):
-        """APPROACHING state: Navigate to barrel using Nav2."""
+    def approaching(self, twist):
+        """APPROACHING state: Move towards barrel."""
         
         # Check if we still see barrels
         if len(self.barrels) == 0:
-            # Lost sight of barrel - go back to searching
-            self.get_logger().warn("Lost sight of barrel, returning to SEARCHING")
-            self.target_barrel = None
-            self.state = State.SEARCHING
+            self.confirmation_count += 1
+            if self.confirmation_count >= self.CONFIRMATION_THRESHOLD:
+                # Lost sight of barrel - go back to searching
+                self.get_logger().warn("Lost sight of barrel, returning to SEARCHING")
+                self.target_barrel = None
+                self.confirmation_count = 0
+                self.state = State.SEARCHING
+            # Keep moving forward slowly while confirming loss
+            twist.linear.x = 0.1
+            twist.angular.z = 0.0
             return
+        
+        # Reset confirmation count since we see barrel
+        self.confirmation_count = 0
         
         # Update target to largest visible barrel
         self.target_barrel = max(self.barrels, key=lambda b: b.size)
         
         # The barrel's x,y from camera is relative to robot
-        # x = forward distance, y = left/right offset
         barrel_x = self.target_barrel.x  # Forward distance
-        barrel_y = self.target_barrel.y  # Left/right offset
+        barrel_y = self.target_barrel.y  # Left/right offset (positive = left)
         barrel_size = self.target_barrel.size
         
-        self.get_logger().info(f"Approaching barrel: x={barrel_x:.2f}, y={barrel_y:.2f}, size={barrel_size:.2f}")
+        self.get_logger().info(
+            f"APPROACHING: barrel x={barrel_x:.2f}, y={barrel_y:.2f}, size={barrel_size:.2f}",
+            throttle_duration_sec=1.0
+        )
         
         # If barrel is close enough, switch to POSITIONING
-        # Size indicates how close we are (bigger = closer)
         if barrel_size > 100:  # Adjust threshold as needed
             self.get_logger().info("Close enough to barrel, switching to POSITIONING")
-            self.stop_robot()
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
             self.state = State.POSITIONING
             return
         
-        # Move towards the barrel using cmd_vel (simple approach)
-        twist = Twist()
-        
+        # Move towards the barrel
         # Linear speed - move forward
         twist.linear.x = 0.2  # Move forward at 0.2 m/s
         
         # Angular speed - turn towards barrel
         # If barrel_y is positive, barrel is to the left, turn left (positive angular)
-        # If barrel_y is negative, barrel is to the right, turn right (negative angular)
-        angular_gain = 0.01  # Adjust for responsiveness
+        angular_gain = 0.01
         twist.angular.z = angular_gain * barrel_y
         
         # Clamp angular velocity
         max_angular = 0.5
         twist.angular.z = max(-max_angular, min(max_angular, twist.angular.z))
-        
-        self.cmd_vel_publisher.publish(twist)
 
-    def positioning(self):
+    def positioning(self, twist):
         """POSITIONING state: Maneuver barrel behind robot."""
-        pass
+        # TODO: Implement positioning logic
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
 
-    def picking_up(self):
+    def picking_up(self, twist):
         """PICKING_UP state: Call pick_up service."""
-        pass
+        # TODO: Implement pick up logic
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
 
-    def delivering(self):
+    def delivering(self, twist):
         """DELIVERING state: Navigate to collection zone."""
-        pass
+        # TODO: Implement delivering logic
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
 
-    def offloading(self):
+    def offloading(self, twist):
         """OFFLOADING state: Call offload service."""
-        pass
+        # TODO: Implement offload logic
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
 
-    def decontaminating(self):
+    def decontaminating(self, twist):
         """DECONTAMINATING state: Go to cyan zone and decontaminate."""
-        pass
+        # TODO: Implement decontamination logic
+        twist.linear.x = 0.0
+        twist.angular.z = 0.0
 
     # ================================================================
     # MAIN CONTROL LOOP
@@ -472,29 +551,41 @@ class RobotController(Node):
         if hasattr(self, '_startup_delay') and self._startup_delay > 0:
             self._startup_delay -= 1
             if self._startup_delay == 0:
-                self.get_logger().info("Startup delay complete, beginning operation")
+                self.get_logger().info("Startup delay complete, robot is ready")
+                self.ready = True
             return
+        
+        # Don't do anything until ready
+        if not self.ready:
+            return
+        
+        # Create twist message for velocity commands
+        twist = Twist()
         
         # Log state changes
         if self.state != self.previous_state:
             self.get_logger().info(f"State: {self.previous_state} -> {self.state}")
             self.previous_state = self.state
+            self.confirmation_count = 0  # Reset confirmation on state change
 
         # Execute current state
         if self.state == State.SEARCHING:
-            self.searching()
+            self.searching(twist)
         elif self.state == State.APPROACHING:
-            self.approaching()
+            self.approaching(twist)
         elif self.state == State.POSITIONING:
-            self.positioning()
+            self.positioning(twist)
         elif self.state == State.PICKING_UP:
-            self.picking_up()
+            self.picking_up(twist)
         elif self.state == State.DELIVERING:
-            self.delivering()
+            self.delivering(twist)
         elif self.state == State.OFFLOADING:
-            self.offloading()
+            self.offloading(twist)
         elif self.state == State.DECONTAMINATING:
-            self.decontaminating()
+            self.decontaminating(twist)
+        
+        # Publish velocity command
+        self.cmd_vel_publisher.publish(twist)
 
     # ================================================================
     # CLEANUP
