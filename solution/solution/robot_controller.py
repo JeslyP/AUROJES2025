@@ -375,10 +375,13 @@ class RobotController(Node):
         twist = Twist()
         twist.linear.x = 0.0
         twist.angular.z = 0.5  # Rotate at 0.5 rad/s (about 30 deg/s)
-        self.cmd_vel_publisher.publish(twist)
         
-        # Debug: log that we're publishing
-        self.get_logger().info(f"SEARCHING: Publishing cmd_vel angular.z={twist.angular.z}", throttle_duration_sec=2.0)
+        # Publish velocity command
+        self.cmd_vel_publisher.publish(twist)
+        self.get_logger().info(
+            f"SEARCHING: Rotating (angular.z={twist.angular.z}), no barrels seen",
+            throttle_duration_sec=1.0
+        )
 
     def approaching(self):
         """APPROACHING state: Navigate to barrel using Nav2."""
@@ -459,7 +462,15 @@ class RobotController(Node):
         if not self.initial_pose_set:
             self.set_initial_pose()
             self.initial_pose_set = True
-            return  # Give AMCL time to process
+            self._startup_delay = 30  # Wait 3 seconds (30 x 0.1s) for AMCL to initialize
+            return
+        
+        # Wait for AMCL to initialize after setting initial pose
+        if hasattr(self, '_startup_delay') and self._startup_delay > 0:
+            self._startup_delay -= 1
+            if self._startup_delay == 0:
+                self.get_logger().info("Startup delay complete, beginning operation")
+            return
         
         # Log state changes
         if self.state != self.previous_state:
