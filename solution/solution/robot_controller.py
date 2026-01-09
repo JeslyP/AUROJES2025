@@ -373,8 +373,12 @@ class RobotController(Node):
         
         # No barrel found - rotate to search
         twist = Twist()
+        twist.linear.x = 0.0
         twist.angular.z = 0.5  # Rotate at 0.5 rad/s (about 30 deg/s)
         self.cmd_vel_publisher.publish(twist)
+        
+        # Debug: log that we're publishing
+        self.get_logger().info(f"SEARCHING: Publishing cmd_vel angular.z={twist.angular.z}", throttle_duration_sec=2.0)
 
     def approaching(self):
         """APPROACHING state: Navigate to barrel using Nav2."""
