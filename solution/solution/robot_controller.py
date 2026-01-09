@@ -10,7 +10,7 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.action import ActionClient
 
 # Message types
-from geometry_msgs.msg import Twist, PoseStamped
+from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 
@@ -159,6 +159,16 @@ class RobotController(Node):
             10
         )
 
+        # Initial pose publisher for AMCL (namespaced)
+        self.initial_pose_publisher = self.create_publisher(
+            PoseWithCovarianceStamped,
+            'initialpose',
+            10
+        )
+
+        # Flag to track if initial pose has been set
+        self.initial_pose_set = False
+
         # ============================================================
         # SERVICE CLIENTS
         # ============================================================
@@ -263,6 +273,34 @@ class RobotController(Node):
         twist = Twist()
         self.cmd_vel_publisher.publish(twist)
 
+    def publish_initial_pose(self):
+        """Publish initial pose to AMCL for localization."""
+        if self.initial_pose_set:
+            return
+        
+        msg = PoseWithCovarianceStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'map'
+        
+        msg.pose.pose.position.x = self.initial_x
+        msg.pose.pose.position.y = self.initial_y
+        msg.pose.pose.position.z = 0.0
+        
+        # Convert yaw to quaternion
+        msg.pose.pose.orientation.x = 0.0
+        msg.pose.pose.orientation.y = 0.0
+        msg.pose.pose.orientation.z = math.sin(self.initial_yaw / 2.0)
+        msg.pose.pose.orientation.w = math.cos(self.initial_yaw / 2.0)
+        
+        # Set covariance (small values = confident in position)
+        msg.pose.covariance[0] = 0.25  # x variance
+        msg.pose.covariance[7] = 0.25  # y variance
+        msg.pose.covariance[35] = 0.0685  # yaw variance
+        
+        self.initial_pose_publisher.publish(msg)
+        self.initial_pose_set = True
+        self.get_logger().info(f"Published initial pose: x={self.initial_x}, y={self.initial_y}, yaw={self.initial_yaw}")
+
     def distance_to(self, x, y):
         """Calculate distance from robot to a point."""
         return math.sqrt((x - self.robot_x)**2 + (y - self.robot_y)**2)
@@ -272,7 +310,7 @@ class RobotController(Node):
     # ================================================================
 
     def searching(self):
-         """SEARCHING state: Look for barrels by rotating."""
+        """SEARCHING state: Look for barrels by rotating."""
         
         # Check if we see any barrels
         if len(self.barrels) > 0:
@@ -328,6 +366,11 @@ class RobotController(Node):
 
     def control_loop(self):
         """Main control loop - runs at 10 Hz."""
+        
+        # Set initial pose for AMCL (only once)
+        if not self.initial_pose_set:
+            self.publish_initial_pose()
+            return  # Wait for localization to initialize
         
         # Log state changes
         if self.state != self.previous_state:
