@@ -152,10 +152,13 @@ class RobotController(Node):
         # PUBLISHERS
         # ============================================================
         
-        # Velocity commands for direct robot control (namespaced)
+        # Velocity commands for direct robot control
+        # Use absolute path to ensure correct topic
+        cmd_vel_topic = f'/{self.robot_name}/cmd_vel'
+        self.get_logger().info(f"Publishing velocity commands to: {cmd_vel_topic}")
         self.cmd_vel_publisher = self.create_publisher(
             Twist,
-            'cmd_vel',
+            cmd_vel_topic,
             10
         )
 
