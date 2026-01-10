@@ -584,6 +584,12 @@ class RobotController(Node):
         elif self.state == State.DECONTAMINATING:
             self.decontaminating(twist)
         
+        # Debug: log what we're publishing
+        self.get_logger().info(
+            f"Publishing cmd_vel: linear.x={twist.linear.x:.2f}, angular.z={twist.angular.z:.2f}",
+            throttle_duration_sec=1.0
+        )
+        
         # Publish velocity command
         self.cmd_vel_publisher.publish(twist)
 
