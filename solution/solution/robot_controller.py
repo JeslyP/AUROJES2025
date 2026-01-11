@@ -248,6 +248,14 @@ class RobotController(Node):
         self.goal_handle = None
         self.navigation_complete = False
         self.navigation_result = None
+        self.navigation_started = False  # Track if we've sent a goal
+
+        # ============================================================
+        # STARTUP DELAY
+        # ============================================================
+        self.startup_delay_count = 0
+        self.startup_delay_max = 50  # Wait 5 seconds (50 x 0.1s) for Nav2 to be ready
+        self.nav2_ready = False
 
         # ============================================================
         # CONTROL LOOP TIMER
@@ -481,26 +489,11 @@ class RobotController(Node):
     def searching(self):
         """SEARCHING state: Navigate to waypoints using Nav2, look for barrels."""
         
-        # Check if we see any barrels while navigating
-        if len(self.barrels) > 0:
-            # Found barrel(s)! Cancel navigation and go to it
-            largest_barrel = max(self.barrels, key=lambda b: b.size)
-            
-            self.get_logger().info(
-                f"Found barrel during search! Colour: {largest_barrel.colour}, "
-                f"Size: {largest_barrel.size:.1f}"
-            )
-            
-            # Cancel current navigation
-            self.cancel_navigation()
-            
-            # Set target and switch state
-            self.target_barrel = largest_barrel
-            self.state = State.APPROACHING
-            return
+        # TODO: Re-enable barrel detection later
+        # For now, just test Nav2 navigation without switching to APPROACHING
         
-        # Check if we're currently navigating
-        if self.goal_handle is None:
+        # Check if we need to start a new navigation
+        if not self.navigation_started:
             # Start navigating to current waypoint
             waypoint = self.waypoints[self.current_waypoint_index]
             self.get_logger().info(
@@ -508,25 +501,31 @@ class RobotController(Node):
                 f"'{waypoint['name']}' at ({waypoint['x']:.2f}, {waypoint['y']:.2f})"
             )
             self.navigate_to_pose(waypoint['x'], waypoint['y'])
+            self.navigation_started = True
             return
         
-        # Check if navigation completed
-        if self.navigation_complete:
-            waypoint = self.waypoints[self.current_waypoint_index]
-            if self.navigation_result == 'succeeded':
-                self.get_logger().info(f"Reached waypoint '{waypoint['name']}'")
-            else:
-                self.get_logger().warn(f"Navigation to '{waypoint['name']}' failed: {self.navigation_result}")
-            
-            # Move to next waypoint
-            self.current_waypoint_index += 1
-            if self.current_waypoint_index >= len(self.waypoints):
-                self.current_waypoint_index = 0  # Loop back
-                self.get_logger().info("Completed all waypoints, starting patrol again")
-            
-            # Reset for next navigation
-            self.goal_handle = None
-            self.navigation_complete = False
+        # Wait for navigation to complete
+        if not self.navigation_complete:
+            # Still navigating, do nothing
+            return
+        
+        # Navigation completed, process result
+        waypoint = self.waypoints[self.current_waypoint_index]
+        if self.navigation_result == 'succeeded':
+            self.get_logger().info(f"Reached waypoint '{waypoint['name']}'")
+        else:
+            self.get_logger().warn(f"Navigation to '{waypoint['name']}' failed: {self.navigation_result}")
+        
+        # Move to next waypoint
+        self.current_waypoint_index += 1
+        if self.current_waypoint_index >= len(self.waypoints):
+            self.current_waypoint_index = 0  # Loop back
+            self.get_logger().info("Completed all waypoints, starting patrol again")
+        
+        # Reset for next navigation
+        self.goal_handle = None
+        self.navigation_complete = False
+        self.navigation_started = False
 
     def approaching(self):
         """APPROACHING state: Navigate to barrel."""
@@ -564,6 +563,16 @@ class RobotController(Node):
             self.set_initial_pose()
             self.initial_pose_set = True
             return  # Give AMCL time to process
+        
+        # Wait for Nav2 to be ready after initial pose
+        if not self.nav2_ready:
+            self.startup_delay_count += 1
+            if self.startup_delay_count >= self.startup_delay_max:
+                self.nav2_ready = True
+                self.get_logger().info("Nav2 startup delay complete, beginning navigation")
+            elif self.startup_delay_count % 10 == 0:  # Log every second
+                self.get_logger().info(f"Waiting for Nav2... {self.startup_delay_count}/{self.startup_delay_max}")
+            return
         
         # Log state changes
         if self.state != self.previous_state:
