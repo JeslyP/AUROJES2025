@@ -159,10 +159,12 @@ class RobotController(Node):
             10
         )
 
-        # Initial pose publisher for AMCL (namespaced)
+        # Initial pose publisher for AMCL (use absolute path)
+        initialpose_topic = f'/{self.robot_name}/initialpose'
+        self.get_logger().info(f"Publishing initial pose to: {initialpose_topic}")
         self.initial_pose_publisher = self.create_publisher(
             PoseWithCovarianceStamped,
-            'initialpose',
+            initialpose_topic,
             10
         )
 
@@ -278,11 +280,11 @@ class RobotController(Node):
         msg.header.stamp = self.get_clock().now().to_msg()
         
         # Map coordinates (found by manually setting pose in RViz)
-        # The Gazebo spawn (0, -2) corresponds to map position (~0, 0)
-        # This offset exists because the map origin differs from Gazebo origin
-        map_x = 0.0
-        map_y = 0.0
-        map_yaw = self.initial_yaw  # Keep the yaw from launch file
+        # The Gazebo spawn (0, -2) corresponds to map position (0.08, 7.23)
+        map_x = 0.08
+        map_y = 7.23
+        # Rotate 90 degrees to the right (-π/2 radians)
+        map_yaw = self.initial_yaw - (math.pi / 2.0)
         
         msg.pose.pose.position.x = map_x
         msg.pose.pose.position.y = map_y
@@ -300,7 +302,7 @@ class RobotController(Node):
                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                               0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891909122467]
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.068]
         
         self.initial_pose_publisher.publish(msg)
         self.get_logger().info(f"Published initial pose: x={map_x}, y={map_y}, yaw={map_yaw}")
@@ -329,7 +331,7 @@ class RobotController(Node):
                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                    0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891909122467]
+                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.068]
             self.initial_pose_publisher.publish(msg)
         else:
             # Stop the timer after 3 republishes
