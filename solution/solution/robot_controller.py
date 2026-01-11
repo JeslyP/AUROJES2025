@@ -6,8 +6,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import ExternalShutdownException
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.action import ActionClient
+from action_msgs.msg import GoalStatus
 
 # Message types
 from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
@@ -25,13 +26,14 @@ from nav2_msgs.action import NavigateToPose
 
 
 class State(Enum):
-    SEARCHING = 0
-    APPROACHING = 1
-    POSITIONING = 2
-    PICKING_UP = 3
-    DELIVERING = 4
-    OFFLOADING = 5
-    DECONTAMINATING = 6
+    SET_INITIAL_POSE = 0
+    SEARCHING = 1
+    APPROACHING = 2
+    POSITIONING = 3
+    PICKING_UP = 4
+    DELIVERING = 5
+    OFFLOADING = 6
+    DECONTAMINATING = 7
 
 
 class RobotController(Node):
@@ -58,7 +60,7 @@ class RobotController(Node):
         # ============================================================
         # STATE MACHINE
         # ============================================================
-        self.state = State.SEARCHING
+        self.state = State.SET_INITIAL_POSE
         self.previous_state = None
 
         # ============================================================
@@ -76,11 +78,6 @@ class RobotController(Node):
         # Target tracking
         self.target_barrel = None   # Current barrel we're going for
 
-        # Control flags
-        self.ready = False          # Ready to start (after AMCL initialized)
-        self.confirmation_count = 0 # Counter for state confirmations
-        self.CONFIRMATION_THRESHOLD = 5  # Number of confirmations before state change
-
         # Known zone positions (from barrel_manager.py)
         # Green collection zones
         self.collection_zone_1 = {'x': 13.5, 'y': 9.4}
@@ -89,9 +86,25 @@ class RobotController(Node):
         self.decontamination_zone = {'x': 7.5, 'y': 9.4}
 
         # ============================================================
-        # CALLBACK GROUPS (for async service calls)
+        # NAV2 WAYPOINTS - Locations to search for barrels
+        # TODO: Update these coordinates based on your map!
         # ============================================================
-        self.callback_group = MutuallyExclusiveCallbackGroup()
+        self.waypoints = [
+            {'x': 3.0, 'y': 0.0},      # Waypoint 1
+            {'x': 6.0, 'y': 0.0},      # Waypoint 2
+            {'x': 9.0, 'y': 3.0},      # Waypoint 3
+            {'x': 12.0, 'y': 6.0},     # Waypoint 4
+            {'x': 15.0, 'y': 9.0},     # Waypoint 5
+            {'x': 18.0, 'y': 6.0},     # Waypoint 6
+            {'x': 12.0, 'y': 3.0},     # Waypoint 7
+            {'x': 6.0, 'y': 6.0},      # Waypoint 8
+        ]
+        self.current_waypoint_index = 0
+
+        # ============================================================
+        # CALLBACK GROUPS (for async service/action calls)
+        # ============================================================
+        self.callback_group = ReentrantCallbackGroup()
 
         # ============================================================
         # SUBSCRIBERS
@@ -158,7 +171,6 @@ class RobotController(Node):
         # ============================================================
         
         # Velocity commands for direct robot control
-        # Use absolute path to ensure correct topic
         cmd_vel_topic = f'/{self.robot_name}/cmd_vel'
         self.get_logger().info(f"Publishing velocity commands to: {cmd_vel_topic}")
         self.cmd_vel_publisher = self.create_publisher(
@@ -173,9 +185,6 @@ class RobotController(Node):
             'initialpose',
             10
         )
-
-        # Flag to publish initial pose only once
-        self.initial_pose_set = False
 
         # ============================================================
         # SERVICE CLIENTS
@@ -213,9 +222,16 @@ class RobotController(Node):
             callback_group=self.callback_group
         )
 
-        # Navigation state
-        self.nav_goal_handle = None
-        self.nav_in_progress = False
+        # Navigation state tracking
+        self.goal_handle = None
+        self.navigation_complete = False
+        self.navigation_result = None
+
+        # ============================================================
+        # INITIAL POSE TRACKING
+        # ============================================================
+        self.initial_pose_count = 0
+        self.initial_pose_max = 5  # Publish initial pose 5 times
 
         # ============================================================
         # CONTROL LOOP TIMER
@@ -224,7 +240,7 @@ class RobotController(Node):
         self.timer = self.create_timer(self.timer_period, self.control_loop)
 
         self.get_logger().info(f"Initial pose - x: {self.initial_x}, y: {self.initial_y}, yaw: {self.initial_yaw}")
-        self.get_logger().info("Robot controller initialized. Starting in SEARCHING state.")
+        self.get_logger().info("Robot controller initialized. Starting in SET_INITIAL_POSE state.")
 
     # ================================================================
     # SUBSCRIBER CALLBACKS
@@ -233,9 +249,11 @@ class RobotController(Node):
     def barrel_callback(self, msg):
         """Callback for barrel detection from camera."""
         self.barrels = msg.data
-        # Debug: log when barrels are detected
         if len(self.barrels) > 0:
-            self.get_logger().info(f"Barrel callback: detected {len(self.barrels)} barrel(s)")
+            self.get_logger().info(
+                f"Barrel callback: detected {len(self.barrels)} barrel(s)",
+                throttle_duration_sec=2.0
+            )
 
     def zone_callback(self, msg):
         """Callback for zone detection from camera."""
@@ -276,7 +294,7 @@ class RobotController(Node):
                 break
 
     # ================================================================
-    # HELPER METHODS
+    # NAV2 METHODS
     # ================================================================
 
     def set_initial_pose(self):
@@ -285,13 +303,10 @@ class RobotController(Node):
         msg.header.frame_id = 'map'
         msg.header.stamp = self.get_clock().now().to_msg()
         
-        # Map coordinates (found by manually setting pose in RViz)
-        # The Gazebo spawn (0, -2) corresponds to map position (~0, 0)
-        # This offset exists because the map origin differs from Gazebo origin
+        # Map coordinates - robot spawns at Gazebo (0, -2) which maps to (0, 0)
         map_x = 0.0
         map_y = 0.0
-        # Adjust yaw by -90 degrees (subtract pi/2) to correct orientation
-        map_yaw = self.initial_yaw - (math.pi / 2.0)
+        map_yaw = self.initial_yaw - (math.pi / 2.0)  # Adjust for orientation offset
         
         msg.pose.pose.position.x = map_x
         msg.pose.pose.position.y = map_y
@@ -303,46 +318,109 @@ class RobotController(Node):
         msg.pose.pose.orientation.z = math.sin(map_yaw / 2.0)
         msg.pose.pose.orientation.w = math.cos(map_yaw / 2.0)
         
-        # Set covariance (small values = high confidence)
+        # Set covariance
         msg.pose.covariance = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
                                0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                                0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                               0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891909122467]
+                               0.0, 0.0, 0.0, 0.0, 0.0, 0.068]
         
         self.initial_pose_publisher.publish(msg)
-        self.get_logger().info(f"Published initial pose: x={map_x}, y={map_y}, yaw={map_yaw}")
+        self.get_logger().info(
+            f"Published initial pose ({self.initial_pose_count + 1}/{self.initial_pose_max}): "
+            f"x={map_x}, y={map_y}, yaw={map_yaw:.2f}"
+        )
+
+    def navigate_to_pose(self, x, y, yaw=0.0):
+        """Send a navigation goal to Nav2."""
         
-        # Republish a few times to ensure AMCL receives it
-        self._republish_count = 0
-        self._map_x = map_x
-        self._map_y = map_y
-        self._map_yaw = map_yaw
-        self.republish_timer = self.create_timer(0.5, self._republish_initial_pose)
+        # Wait for Nav2 action server
+        if not self.nav_to_pose_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("Nav2 action server not available!")
+            return False
+
+        # Create goal message
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.position.z = 0.0
+
+        # Convert yaw to quaternion
+        goal_msg.pose.pose.orientation.x = 0.0
+        goal_msg.pose.pose.orientation.y = 0.0
+        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+        self.get_logger().info(f"Sending Nav2 goal: x={x:.2f}, y={y:.2f}")
         
-    def _republish_initial_pose(self):
-        """Republish initial pose a few times to ensure AMCL gets it."""
-        self._republish_count += 1
-            
-        if self._republish_count <= 3:
-            msg = PoseWithCovarianceStamped()
-            msg.header.frame_id = 'map'
-            msg.header.stamp = self.get_clock().now().to_msg()
-            msg.pose.pose.position.x = self._map_x
-            msg.pose.pose.position.y = self._map_y
-            msg.pose.pose.orientation.z = math.sin(self._map_yaw / 2.0)
-            msg.pose.pose.orientation.w = math.cos(self._map_yaw / 2.0)
-            msg.pose.covariance = [0.25, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                   0.0, 0.25, 0.0, 0.0, 0.0, 0.0,
-                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                   0.0, 0.0, 0.0, 0.0, 0.0, 0.06853891909122467]
-            self.initial_pose_publisher.publish(msg)
+        # Reset navigation state
+        self.navigation_complete = False
+        self.navigation_result = None
+        
+        # Send goal
+        send_goal_future = self.nav_to_pose_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.nav_feedback_callback
+        )
+        send_goal_future.add_done_callback(self.nav_goal_response_callback)
+        
+        return True
+
+    def nav_goal_response_callback(self, future):
+        """Callback when Nav2 goal is accepted/rejected."""
+        self.goal_handle = future.result()
+        
+        if not self.goal_handle.accepted:
+            self.get_logger().warn("Nav2 goal was rejected!")
+            self.navigation_complete = True
+            self.navigation_result = 'rejected'
+            return
+
+        self.get_logger().info("Nav2 goal accepted, navigating...")
+        
+        # Get result when navigation completes
+        result_future = self.goal_handle.get_result_async()
+        result_future.add_done_callback(self.nav_result_callback)
+
+    def nav_feedback_callback(self, feedback_msg):
+        """Callback for Nav2 navigation feedback."""
+        pass
+
+    def nav_result_callback(self, future):
+        """Callback when Nav2 navigation completes."""
+        result = future.result()
+        status = result.status
+        
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info("Navigation succeeded!")
+            self.navigation_result = 'succeeded'
+        elif status == GoalStatus.STATUS_ABORTED:
+            self.get_logger().warn("Navigation aborted!")
+            self.navigation_result = 'aborted'
+        elif status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().warn("Navigation canceled!")
+            self.navigation_result = 'canceled'
         else:
-            # Stop the timer after 3 republishes
-            self.republish_timer.cancel()
+            self.get_logger().warn(f"Navigation finished with status: {status}")
+            self.navigation_result = 'unknown'
+        
+        self.navigation_complete = True
+
+    def cancel_navigation(self):
+        """Cancel current navigation goal."""
+        if self.goal_handle is not None:
+            self.get_logger().info("Cancelling navigation...")
+            self.goal_handle.cancel_goal_async()
+            self.goal_handle = None
+            self.navigation_complete = True
+            self.navigation_result = 'canceled'
+
+    # ================================================================
+    # HELPER METHODS
+    # ================================================================
 
     def stop_robot(self):
         """Stop the robot."""
@@ -354,184 +432,126 @@ class RobotController(Node):
         return math.sqrt((x - self.robot_x)**2 + (y - self.robot_y)**2)
 
     # ================================================================
-    # STATE METHODS (TODO: Implement these)
+    # STATE METHODS
     # ================================================================
 
-    def searching(self, twist):
-        """SEARCHING state: Look for barrels by rotating, then moving if none found."""
+    def searching(self):
+        """SEARCHING state: Navigate to waypoints using Nav2, look for barrels."""
         
-        # Initialize search tracking variables if not exists
-        if not hasattr(self, 'search_rotation_count'):
-            self.search_rotation_count = 0
-            self.search_phase = 'ROTATING'  # ROTATING or MOVING
-            self.move_distance = 0.0
-        
-        # Check if we see any barrels
+        # Check if we see any barrels while navigating
         if len(self.barrels) > 0:
-            # Found barrel(s)! Confirm detection
-            self.confirmation_count += 1
+            # Found barrel(s)! Cancel navigation and go to it
+            largest_barrel = max(self.barrels, key=lambda b: b.size)
             
-            if self.confirmation_count >= self.CONFIRMATION_THRESHOLD:
-                # Confirmed barrel detection
-                largest_barrel = max(self.barrels, key=lambda b: b.size)
-                self.target_barrel = largest_barrel
-                self.get_logger().info(
-                    f"Found barrel! Colour: {largest_barrel.colour}, "
-                    f"Size: {largest_barrel.size:.2f}, "
-                    f"Offset: x={largest_barrel.x:.2f}, y={largest_barrel.y:.2f}"
-                )
-                
-                # Reset search variables and switch state
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.confirmation_count = 0
-                self.search_rotation_count = 0
-                self.search_phase = 'ROTATING'
-                self.state = State.APPROACHING
-            else:
-                # Still confirming, slow down rotation
-                twist.linear.x = 0.0
-                twist.angular.z = 0.3
+            self.get_logger().info(
+                f"Found barrel during search! Colour: {largest_barrel.colour}, "
+                f"Size: {largest_barrel.size:.1f}"
+            )
+            
+            # Cancel current navigation
+            self.cancel_navigation()
+            
+            # Set target and switch state
+            self.target_barrel = largest_barrel
+            self.state = State.APPROACHING
             return
         
-        # No barrel found - reset confirmation
-        self.confirmation_count = 0
+        # Check if we're currently navigating
+        if self.goal_handle is None:
+            # Start navigating to current waypoint
+            waypoint = self.waypoints[self.current_waypoint_index]
+            self.get_logger().info(
+                f"SEARCHING: Navigating to waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} "
+                f"at ({waypoint['x']}, {waypoint['y']})"
+            )
+            self.navigate_to_pose(waypoint['x'], waypoint['y'])
+            return
         
-        if self.search_phase == 'ROTATING':
-            # Rotate to scan for barrels
-            twist.linear.x = 0.0
-            twist.angular.z = 0.5  # Rotate at 0.5 rad/s
+        # Check if navigation completed
+        if self.navigation_complete:
+            if self.navigation_result == 'succeeded':
+                self.get_logger().info(f"Reached waypoint {self.current_waypoint_index + 1}")
+            else:
+                self.get_logger().warn(f"Navigation to waypoint failed: {self.navigation_result}")
             
-            # Count rotation cycles (roughly 12 seconds for full 360° at 0.5 rad/s)
-            self.search_rotation_count += 1
+            # Move to next waypoint
+            self.current_waypoint_index += 1
+            if self.current_waypoint_index >= len(self.waypoints):
+                self.current_waypoint_index = 0  # Loop back
+                self.get_logger().info("Completed all waypoints, starting over")
             
-            # After roughly one full rotation (about 120 iterations at 10Hz), move to new spot
-            if self.search_rotation_count > 120:
-                self.get_logger().info("No barrels found, moving to new location")
-                self.search_phase = 'MOVING'
-                self.search_rotation_count = 0
-                self.move_distance = 0.0
-            
-            self.get_logger().info(
-                f"SEARCHING (ROTATING): count={self.search_rotation_count}",
-                throttle_duration_sec=2.0
-            )
-            
-        elif self.search_phase == 'MOVING':
-            # Move forward to a new location
-            twist.linear.x = 0.2  # Move forward
-            twist.angular.z = 0.0
-            
-            self.move_distance += twist.linear.x * self.timer_period  # Track distance
-            
-            # Check for obstacles using LiDAR (front)
-            if len(self.scan_data) > 0:
-                # Front scan (around index 0, which is directly ahead)
-                front_ranges = self.scan_data[0:30] + self.scan_data[-30:]
-                front_ranges = [r for r in front_ranges if r > 0.1]  # Filter invalid readings
-                
-                if len(front_ranges) > 0:
-                    min_front = min(front_ranges)
-                    
-                    if min_front < 0.5:  # Obstacle within 0.5m
-                        self.get_logger().info(f"Obstacle ahead ({min_front:.2f}m), turning")
-                        twist.linear.x = 0.0
-                        twist.angular.z = 0.5  # Turn to avoid
-            
-            # After moving ~2 meters, go back to rotating
-            if self.move_distance > 2.0:
-                self.get_logger().info("Moved to new location, scanning again")
-                self.search_phase = 'ROTATING'
-                self.move_distance = 0.0
-            
-            self.get_logger().info(
-                f"SEARCHING (MOVING): distance={self.move_distance:.2f}m",
-                throttle_duration_sec=2.0
-            )
+            # Reset for next navigation
+            self.goal_handle = None
+            self.navigation_complete = False
 
-    def approaching(self, twist):
-        """APPROACHING state: Move towards barrel."""
+    def approaching(self):
+        """APPROACHING state: Move towards barrel using cmd_vel."""
         
         # Check if we still see barrels
         if len(self.barrels) == 0:
-            self.confirmation_count += 1
-            if self.confirmation_count >= self.CONFIRMATION_THRESHOLD:
-                # Lost sight of barrel - go back to searching
-                self.get_logger().warn("Lost sight of barrel, returning to SEARCHING")
-                self.target_barrel = None
-                self.confirmation_count = 0
-                self.state = State.SEARCHING
-            # Keep moving forward slowly while confirming loss
-            twist.linear.x = 0.1
-            twist.angular.z = 0.0
+            self.get_logger().warn("Lost sight of barrel, returning to SEARCHING")
+            self.target_barrel = None
+            self.state = State.SEARCHING
             return
-        
-        # Reset confirmation count since we see barrel
-        self.confirmation_count = 0
         
         # Update target to largest visible barrel
         self.target_barrel = max(self.barrels, key=lambda b: b.size)
         
-        # The barrel's x,y from camera is relative to robot
-        barrel_x = self.target_barrel.x  # Forward distance
-        barrel_y = self.target_barrel.y  # Left/right offset (positive = left)
+        barrel_y = self.target_barrel.y  # Left/right offset
         barrel_size = self.target_barrel.size
         
         self.get_logger().info(
-            f"APPROACHING: barrel x={barrel_x:.2f}, y={barrel_y:.2f}, size={barrel_size:.2f}",
+            f"APPROACHING: y={barrel_y:.1f}, size={barrel_size:.1f}",
             throttle_duration_sec=1.0
         )
         
         # If barrel is close enough, switch to POSITIONING
-        if barrel_size > 100:  # Adjust threshold as needed
+        if barrel_size > 5000:  # Adjust threshold as needed
             self.get_logger().info("Close enough to barrel, switching to POSITIONING")
-            twist.linear.x = 0.0
-            twist.angular.z = 0.0
+            self.stop_robot()
             self.state = State.POSITIONING
             return
         
         # Move towards the barrel
-        # Linear speed - move forward
-        twist.linear.x = 0.2  # Move forward at 0.2 m/s
+        twist = Twist()
+        twist.linear.x = 0.2  # Move forward
         
-        # Angular speed - turn towards barrel
-        # If barrel_y is positive, barrel is to the left, turn left (positive angular)
-        angular_gain = 0.01
+        # Steer towards barrel (barrel_y: positive = left)
+        angular_gain = 0.002
         twist.angular.z = angular_gain * barrel_y
+        twist.angular.z = max(-0.5, min(0.5, twist.angular.z))  # Clamp
         
-        # Clamp angular velocity
-        max_angular = 0.5
-        twist.angular.z = max(-max_angular, min(max_angular, twist.angular.z))
+        self.cmd_vel_publisher.publish(twist)
 
-    def positioning(self, twist):
+    def positioning(self):
         """POSITIONING state: Maneuver barrel behind robot."""
         # TODO: Implement positioning logic
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
+        self.get_logger().info("POSITIONING: Not implemented yet", throttle_duration_sec=2.0)
+        self.stop_robot()
 
-    def picking_up(self, twist):
+    def picking_up(self):
         """PICKING_UP state: Call pick_up service."""
         # TODO: Implement pick up logic
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
+        self.get_logger().info("PICKING_UP: Not implemented yet", throttle_duration_sec=2.0)
+        self.stop_robot()
 
-    def delivering(self, twist):
+    def delivering(self):
         """DELIVERING state: Navigate to collection zone."""
         # TODO: Implement delivering logic
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
+        self.get_logger().info("DELIVERING: Not implemented yet", throttle_duration_sec=2.0)
+        self.stop_robot()
 
-    def offloading(self, twist):
+    def offloading(self):
         """OFFLOADING state: Call offload service."""
         # TODO: Implement offload logic
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
+        self.get_logger().info("OFFLOADING: Not implemented yet", throttle_duration_sec=2.0)
+        self.stop_robot()
 
-    def decontaminating(self, twist):
+    def decontaminating(self):
         """DECONTAMINATING state: Go to cyan zone and decontaminate."""
         # TODO: Implement decontamination logic
-        twist.linear.x = 0.0
-        twist.angular.z = 0.0
+        self.get_logger().info("DECONTAMINATING: Not implemented yet", throttle_duration_sec=2.0)
+        self.stop_robot()
 
     # ================================================================
     # MAIN CONTROL LOOP
@@ -540,64 +560,48 @@ class RobotController(Node):
     def control_loop(self):
         """Main control loop - runs at 10 Hz."""
         
-        # Set initial pose for AMCL (only once)
-        if not self.initial_pose_set:
-            self.set_initial_pose()
-            self.initial_pose_set = True
-            self._startup_delay = 30  # Wait 3 seconds (30 x 0.1s) for AMCL to initialize
-            return
-        
-        # Wait for AMCL to initialize after setting initial pose
-        if hasattr(self, '_startup_delay') and self._startup_delay > 0:
-            self._startup_delay -= 1
-            if self._startup_delay == 0:
-                self.get_logger().info("Startup delay complete, robot is ready")
-                self.ready = True
-            return
-        
-        # Don't do anything until ready
-        if not self.ready:
-            return
-        
-        # Create twist message for velocity commands
-        twist = Twist()
-        
         # Log state changes
         if self.state != self.previous_state:
             self.get_logger().info(f"State: {self.previous_state} -> {self.state}")
             self.previous_state = self.state
-            self.confirmation_count = 0  # Reset confirmation on state change
 
-        # Execute current state
-        if self.state == State.SEARCHING:
-            self.searching(twist)
+        # State machine
+        if self.state == State.SET_INITIAL_POSE:
+            # Publish initial pose multiple times
+            self.set_initial_pose()
+            self.initial_pose_count += 1
+            
+            if self.initial_pose_count >= self.initial_pose_max:
+                self.get_logger().info("Initial pose set, switching to SEARCHING")
+                self.state = State.SEARCHING
+                
+        elif self.state == State.SEARCHING:
+            self.searching()
+            
         elif self.state == State.APPROACHING:
-            self.approaching(twist)
+            self.approaching()
+            
         elif self.state == State.POSITIONING:
-            self.positioning(twist)
+            self.positioning()
+            
         elif self.state == State.PICKING_UP:
-            self.picking_up(twist)
+            self.picking_up()
+            
         elif self.state == State.DELIVERING:
-            self.delivering(twist)
+            self.delivering()
+            
         elif self.state == State.OFFLOADING:
-            self.offloading(twist)
+            self.offloading()
+            
         elif self.state == State.DECONTAMINATING:
-            self.decontaminating(twist)
-        
-        # Debug: log what we're publishing
-        self.get_logger().info(
-            f"Publishing cmd_vel: linear.x={twist.linear.x:.2f}, angular.z={twist.angular.z:.2f}",
-            throttle_duration_sec=1.0
-        )
-        
-        # Publish velocity command
-        self.cmd_vel_publisher.publish(twist)
+            self.decontaminating()
 
     # ================================================================
     # CLEANUP
     # ================================================================
 
     def destroy_node(self):
+        self.cancel_navigation()
         self.stop_robot()
         super().destroy_node()
 
