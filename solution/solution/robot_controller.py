@@ -6,8 +6,9 @@ import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import ExternalShutdownException
-from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup, ReentrantCallbackGroup
 from rclpy.action import ActionClient
+from action_msgs.msg import GoalStatus
 
 # Message types
 from geometry_msgs.msg import Twist, PoseStamped, PoseWithCovarianceStamped
@@ -76,17 +77,53 @@ class RobotController(Node):
         # Target tracking
         self.target_barrel = None   # Current barrel we're going for
 
-        # Known zone positions (from barrel_manager.py)
+        # ============================================================
+        # ZONE POSITIONS (from RViz measurements)
+        # ============================================================
         # Green collection zones
-        self.collection_zone_1 = {'x': 13.5, 'y': 9.4}
-        self.collection_zone_2 = {'x': 19.5, 'y': 9.4}
+        self.collection_zone_1 = {'x': 9.53, 'y': -6.45}
+        self.collection_zone_2 = {'x': 9.41, 'y': -13.0}
         # Cyan decontamination zone
-        self.decontamination_zone = {'x': 7.5, 'y': 9.4}
+        self.decontamination_zone = {'x': 9.58, 'y': -0.33}
 
         # ============================================================
-        # CALLBACK GROUPS (for async service calls)
+        # NAV2 WAYPOINTS - Patrol route to search for barrels
         # ============================================================
-        self.callback_group = MutuallyExclusiveCallbackGroup()
+        self.waypoints = [
+            # Starting area
+            {'x': 0.05, 'y': 7.21, 'name': 'Start'},
+            
+            # Left corridor (bottom to top)
+            {'x': 2.29, 'y': 8.91, 'name': 'Left corridor bottom'},
+            {'x': 9.75, 'y': 8.84, 'name': 'Left corridor top'},
+            
+            # Big room patrol
+            {'x': 10.05, 'y': 14.85, 'name': 'Big room entrance'},
+            {'x': 6.15, 'y': 14.81, 'name': 'Big room bottom right'},
+            {'x': 6.43, 'y': 19.25, 'name': 'Big room bottom center'},
+            {'x': 6.37, 'y': 23.28, 'name': 'Big room bottom left'},
+            {'x': 10.15, 'y': 23.14, 'name': 'Big room middle left'},
+            {'x': 14.43, 'y': 23.02, 'name': 'Big room top left'},
+            {'x': 14.26, 'y': 18.68, 'name': 'Big room top middle'},
+            {'x': 14.29, 'y': 14.88, 'name': 'Big room top right'},
+            {'x': 10.13, 'y': 19.61, 'name': 'Big room center'},
+            
+            # Return via big room entrance
+            {'x': 10.05, 'y': 14.85, 'name': 'Big room entrance'},
+            
+            # Right corridor (top to bottom)
+            {'x': 9.35, 'y': 4.68, 'name': 'Right corridor top'},
+            {'x': 2.26, 'y': 5.95, 'name': 'Right corridor bottom'},
+            
+            # Back to start
+            {'x': 0.05, 'y': 7.21, 'name': 'Start'},
+        ]
+        self.current_waypoint_index = 0
+
+        # ============================================================
+        # CALLBACK GROUPS (for async service/action calls)
+        # ============================================================
+        self.callback_group = ReentrantCallbackGroup()
 
         # ============================================================
         # SUBSCRIBERS
@@ -207,9 +244,10 @@ class RobotController(Node):
             callback_group=self.callback_group
         )
 
-        # Navigation state
-        self.nav_goal_handle = None
-        self.nav_in_progress = False
+        # Navigation state tracking
+        self.goal_handle = None
+        self.navigation_complete = False
+        self.navigation_result = None
 
         # ============================================================
         # CONTROL LOOP TIMER
@@ -347,35 +385,148 @@ class RobotController(Node):
         return math.sqrt((x - self.robot_x)**2 + (y - self.robot_y)**2)
 
     # ================================================================
+    # NAV2 METHODS
+    # ================================================================
+
+    def navigate_to_pose(self, x, y, yaw=0.0):
+        """Send a navigation goal to Nav2."""
+        
+        # Wait for Nav2 action server
+        if not self.nav_to_pose_client.wait_for_server(timeout_sec=5.0):
+            self.get_logger().error("Nav2 action server not available!")
+            return False
+
+        # Create goal message
+        goal_msg = NavigateToPose.Goal()
+        goal_msg.pose.header.frame_id = 'map'
+        goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
+        goal_msg.pose.pose.position.x = x
+        goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.position.z = 0.0
+
+        # Convert yaw to quaternion
+        goal_msg.pose.pose.orientation.x = 0.0
+        goal_msg.pose.pose.orientation.y = 0.0
+        goal_msg.pose.pose.orientation.z = math.sin(yaw / 2.0)
+        goal_msg.pose.pose.orientation.w = math.cos(yaw / 2.0)
+
+        self.get_logger().info(f"Sending Nav2 goal: x={x:.2f}, y={y:.2f}")
+        
+        # Reset navigation state
+        self.navigation_complete = False
+        self.navigation_result = None
+        
+        # Send goal
+        send_goal_future = self.nav_to_pose_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.nav_feedback_callback
+        )
+        send_goal_future.add_done_callback(self.nav_goal_response_callback)
+        
+        return True
+
+    def nav_goal_response_callback(self, future):
+        """Callback when Nav2 goal is accepted/rejected."""
+        self.goal_handle = future.result()
+        
+        if not self.goal_handle.accepted:
+            self.get_logger().warn("Nav2 goal was rejected!")
+            self.navigation_complete = True
+            self.navigation_result = 'rejected'
+            return
+
+        self.get_logger().info("Nav2 goal accepted, navigating...")
+        
+        # Get result when navigation completes
+        result_future = self.goal_handle.get_result_async()
+        result_future.add_done_callback(self.nav_result_callback)
+
+    def nav_feedback_callback(self, feedback_msg):
+        """Callback for Nav2 navigation feedback."""
+        pass
+
+    def nav_result_callback(self, future):
+        """Callback when Nav2 navigation completes."""
+        result = future.result()
+        status = result.status
+        
+        if status == GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info("Navigation succeeded!")
+            self.navigation_result = 'succeeded'
+        elif status == GoalStatus.STATUS_ABORTED:
+            self.get_logger().warn("Navigation aborted!")
+            self.navigation_result = 'aborted'
+        elif status == GoalStatus.STATUS_CANCELED:
+            self.get_logger().warn("Navigation canceled!")
+            self.navigation_result = 'canceled'
+        else:
+            self.get_logger().warn(f"Navigation finished with status: {status}")
+            self.navigation_result = 'unknown'
+        
+        self.navigation_complete = True
+
+    def cancel_navigation(self):
+        """Cancel current navigation goal."""
+        if self.goal_handle is not None:
+            self.get_logger().info("Cancelling navigation...")
+            self.goal_handle.cancel_goal_async()
+            self.goal_handle = None
+            self.navigation_complete = True
+            self.navigation_result = 'canceled'
+
+    # ================================================================
     # STATE METHODS (TODO: Implement these)
     # ================================================================
 
     def searching(self):
-        """SEARCHING state: Look for barrels by rotating."""
+        """SEARCHING state: Navigate to waypoints using Nav2, look for barrels."""
         
-        # Check if we see any barrels
+        # Check if we see any barrels while navigating
         if len(self.barrels) > 0:
-            # Found barrel(s)! Pick the largest one (closest/most visible)
+            # Found barrel(s)! Cancel navigation and go to it
             largest_barrel = max(self.barrels, key=lambda b: b.size)
             
-            self.target_barrel = largest_barrel
             self.get_logger().info(
-                f"Found barrel! Colour: {largest_barrel.colour}, "
-                f"Size: {largest_barrel.size:.2f}, "
-                f"Offset: x={largest_barrel.x:.2f}, y={largest_barrel.y:.2f}"
+                f"Found barrel during search! Colour: {largest_barrel.colour}, "
+                f"Size: {largest_barrel.size:.1f}"
             )
             
-            # Stop rotating
-            self.stop_robot()
+            # Cancel current navigation
+            self.cancel_navigation()
             
-            # Switch to APPROACHING state
+            # Set target and switch state
+            self.target_barrel = largest_barrel
             self.state = State.APPROACHING
             return
         
-        # No barrel found - rotate to search
-        twist = Twist()
-        twist.angular.z = 0.5  # Rotate at 0.5 rad/s (about 30 deg/s)
-        self.cmd_vel_publisher.publish(twist)
+        # Check if we're currently navigating
+        if self.goal_handle is None:
+            # Start navigating to current waypoint
+            waypoint = self.waypoints[self.current_waypoint_index]
+            self.get_logger().info(
+                f"SEARCHING: Navigating to waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)} "
+                f"'{waypoint['name']}' at ({waypoint['x']:.2f}, {waypoint['y']:.2f})"
+            )
+            self.navigate_to_pose(waypoint['x'], waypoint['y'])
+            return
+        
+        # Check if navigation completed
+        if self.navigation_complete:
+            waypoint = self.waypoints[self.current_waypoint_index]
+            if self.navigation_result == 'succeeded':
+                self.get_logger().info(f"Reached waypoint '{waypoint['name']}'")
+            else:
+                self.get_logger().warn(f"Navigation to '{waypoint['name']}' failed: {self.navigation_result}")
+            
+            # Move to next waypoint
+            self.current_waypoint_index += 1
+            if self.current_waypoint_index >= len(self.waypoints):
+                self.current_waypoint_index = 0  # Loop back
+                self.get_logger().info("Completed all waypoints, starting patrol again")
+            
+            # Reset for next navigation
+            self.goal_handle = None
+            self.navigation_complete = False
 
     def approaching(self):
         """APPROACHING state: Navigate to barrel."""
@@ -440,6 +591,7 @@ class RobotController(Node):
     # ================================================================
 
     def destroy_node(self):
+        self.cancel_navigation()
         self.stop_robot()
         super().destroy_node()
 
