@@ -254,8 +254,13 @@ class RobotController(Node):
         # STARTUP DELAY
         # ============================================================
         self.startup_delay_count = 0
-        self.startup_delay_max = 50  # Wait 5 seconds (50 x 0.1s) for Nav2 to be ready
+        self.startup_delay_max = 900  # Wait 90 seconds (900 x 0.1s) for Nav2 to fully initialize
         self.nav2_ready = False
+        
+        # Delay between waypoints
+        self.waypoint_delay_count = 0
+        self.waypoint_delay_max = 20  # Wait 2 seconds between waypoints
+        self.waiting_between_waypoints = False
 
         # ============================================================
         # CONTROL LOOP TIMER
@@ -492,6 +497,15 @@ class RobotController(Node):
         # TODO: Re-enable barrel detection later
         # For now, just test Nav2 navigation without switching to APPROACHING
         
+        # If waiting between waypoints, count down
+        if self.waiting_between_waypoints:
+            self.waypoint_delay_count += 1
+            if self.waypoint_delay_count >= self.waypoint_delay_max:
+                self.waiting_between_waypoints = False
+                self.waypoint_delay_count = 0
+                self.get_logger().info("Delay complete, sending next waypoint")
+            return
+        
         # Check if we need to start a new navigation
         if not self.navigation_started:
             # Start navigating to current waypoint
@@ -526,6 +540,11 @@ class RobotController(Node):
         self.goal_handle = None
         self.navigation_complete = False
         self.navigation_started = False
+        
+        # Add delay before next waypoint
+        self.waiting_between_waypoints = True
+        self.waypoint_delay_count = 0
+        self.get_logger().info("Waiting before next waypoint...")
 
     def approaching(self):
         """APPROACHING state: Navigate to barrel."""
@@ -570,8 +589,10 @@ class RobotController(Node):
             if self.startup_delay_count >= self.startup_delay_max:
                 self.nav2_ready = True
                 self.get_logger().info("Nav2 startup delay complete, beginning navigation")
-            elif self.startup_delay_count % 10 == 0:  # Log every second
-                self.get_logger().info(f"Waiting for Nav2... {self.startup_delay_count}/{self.startup_delay_max}")
+            elif self.startup_delay_count % 100 == 0:  # Log every 10 seconds
+                seconds_waited = self.startup_delay_count / 10
+                seconds_total = self.startup_delay_max / 10
+                self.get_logger().info(f"Waiting for Nav2... {seconds_waited:.0f}/{seconds_total:.0f} seconds")
             return
         
         # Log state changes
