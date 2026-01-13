@@ -76,6 +76,8 @@ class RobotController(Node):
 
         # Target tracking
         self.target_barrel = None   # Current barrel we're going for
+        self.last_barrel = None     # Barrel from last frame (for bonus scoring)
+        self.centered_count = 0     # Count frames where barrel is centered
 
         # ============================================================
         # ZONE POSITIONS (from RViz measurements)
@@ -488,14 +490,80 @@ class RobotController(Node):
             self.navigation_result = 'canceled'
 
     # ================================================================
+    # BARREL SELECTION
+    # ================================================================
+
+    def select_best_barrel(self):
+        """Select the best barrel to target based on size and center position."""
+        
+        CAMERA_CENTER = 320.0       # Camera center in pixels
+        MIN_BARREL_SIZE = 50        # Minimum size to consider
+        LAST_BARREL_BONUS = 100     # Bonus for same barrel as last frame
+        
+        if len(self.barrels) == 0:
+            return None
+        
+        best_barrel = None
+        best_score = -999999
+        
+        for barrel in self.barrels:
+            # Skip barrels that are too small (too far away)
+            if barrel.size < MIN_BARREL_SIZE:
+                continue
+            
+            # Calculate center penalty (how far from camera center)
+            # barrel.y is the horizontal offset in pixels
+            center_penalty = abs(barrel.y)
+            
+            # Score = size - center_penalty (bigger and more centered = better)
+            score = barrel.size - center_penalty
+            
+            # Add bonus if this is the same barrel as last frame
+            if self.last_barrel is not None:
+                size_diff = abs(barrel.size - self.last_barrel.size)
+                pos_diff = abs(barrel.y - self.last_barrel.y)
+                # If similar size and position, it's probably the same barrel
+                if size_diff < 500 and pos_diff < 100:
+                    score += LAST_BARREL_BONUS
+            
+            # Update best barrel if this one has higher score
+            if score > best_score:
+                best_score = score
+                best_barrel = barrel
+        
+        return best_barrel
+
+    # ================================================================
     # STATE METHODS (TODO: Implement these)
     # ================================================================
 
     def searching(self):
         """SEARCHING state: Navigate to waypoints using Nav2, look for barrels."""
         
-        # TODO: Re-enable barrel detection later
-        # For now, just test Nav2 navigation without switching to APPROACHING
+        # Check if we see any barrels while navigating
+        if len(self.barrels) > 0:
+            # Find the best barrel to target
+            best_barrel = self.select_best_barrel()
+            
+            if best_barrel is not None:
+                self.get_logger().info(
+                    f"Found barrel! Colour: {best_barrel.colour}, "
+                    f"Size: {best_barrel.size:.1f}, Y: {best_barrel.y:.1f}"
+                )
+                
+                # Cancel current navigation
+                self.cancel_navigation()
+                
+                # Set target and switch state
+                self.target_barrel = best_barrel
+                self.last_barrel = best_barrel
+                self.state = State.APPROACHING
+                
+                # Reset navigation flags
+                self.navigation_started = False
+                self.navigation_complete = False
+                self.waiting_between_waypoints = False
+                return
         
         # If waiting between waypoints, count down
         if self.waiting_between_waypoints:
@@ -547,8 +615,109 @@ class RobotController(Node):
         self.get_logger().info("Waiting before next waypoint...")
 
     def approaching(self):
-        """APPROACHING state: Navigate to barrel."""
-        pass
+        """APPROACHING state: Drive towards barrel using camera feedback."""
+        
+        # Constants
+        CAMERA_CENTER = 320.0       # Camera center in pixels
+        STOP_SIZE = 15000           # Size threshold to stop (close to barrel)
+        SLOW_SIZE = 8000            # Size threshold to slow down
+        FAST_SPEED = 0.25           # Speed when far from barrel
+        SLOW_SPEED = 0.15           # Speed when close to barrel
+        MAX_TURN = 0.5              # Maximum angular velocity
+        TURN_GAIN = 0.002           # Proportional gain for turning
+        WALL_CLEARANCE = 0.35       # Minimum distance to walls (meters)
+        CENTERED_THRESHOLD = 30     # Pixels from center to be "centered"
+        CENTERED_FRAMES_NEEDED = 3  # Frames needed to confirm centered
+        
+        # If no target, go back to searching
+        if self.target_barrel is None:
+            self.get_logger().warn("APPROACHING: No target barrel, returning to SEARCHING")
+            self.state = State.SEARCHING
+            return
+        
+        # Check if we still see barrels
+        if len(self.barrels) == 0:
+            self.get_logger().warn("APPROACHING: Lost sight of barrel, returning to SEARCHING")
+            self.target_barrel = None
+            self.last_barrel = None
+            self.state = State.SEARCHING
+            return
+        
+        # Update target to best barrel (maintains tracking)
+        best_barrel = self.select_best_barrel()
+        if best_barrel is not None:
+            self.target_barrel = best_barrel
+            self.last_barrel = best_barrel
+        
+        # Get barrel info
+        barrel_size = self.target_barrel.size
+        barrel_y = self.target_barrel.y  # Horizontal offset from center (positive = right)
+        
+        # Calculate steering angle
+        # error_x: positive means barrel is to the right, need to turn right (negative angular.z)
+        error_x = barrel_y
+        turn = -TURN_GAIN * error_x  # Negative because positive error needs negative turn
+        
+        # Cap the turn rate
+        turn = max(-MAX_TURN, min(MAX_TURN, turn))
+        
+        # Check LiDAR for wall clearance
+        if len(self.scan_data) > 0:
+            # Left side (around 45-90 degrees)
+            left_ranges = [r for r in self.scan_data[30:90] if 0.1 < r < 10.0]
+            # Right side (around 270-330 degrees)
+            right_ranges = [r for r in self.scan_data[270:330] if 0.1 < r < 10.0]
+            
+            left_min = min(left_ranges) if left_ranges else 10.0
+            right_min = min(right_ranges) if right_ranges else 10.0
+            
+            # Adjust turn if too close to wall
+            if left_min < WALL_CLEARANCE and turn > 0:
+                turn = -0.2  # Turn right instead
+                self.get_logger().info(f"Wall on left ({left_min:.2f}m), turning right")
+            elif right_min < WALL_CLEARANCE and turn < 0:
+                turn = 0.2  # Turn left instead
+                self.get_logger().info(f"Wall on right ({right_min:.2f}m), turning left")
+        
+        # Determine speed based on barrel size
+        if barrel_size > STOP_SIZE:
+            # Very close to barrel - check if centered
+            if abs(error_x) < CENTERED_THRESHOLD:
+                self.centered_count += 1
+                self.get_logger().info(f"APPROACHING: Centered! Count: {self.centered_count}/{CENTERED_FRAMES_NEEDED}")
+                
+                if self.centered_count >= CENTERED_FRAMES_NEEDED:
+                    # Close enough and centered - switch to POSITIONING
+                    self.get_logger().info("APPROACHING: Close and centered, switching to POSITIONING")
+                    self.stop_robot()
+                    self.centered_count = 0
+                    self.state = State.POSITIONING
+                    return
+            else:
+                self.centered_count = 0
+            
+            # Stop forward motion, just turn to center
+            speed = 0.0
+            
+        elif barrel_size > SLOW_SIZE:
+            # Getting close - slow down
+            speed = SLOW_SPEED
+            self.centered_count = 0
+        else:
+            # Far away - go faster
+            speed = FAST_SPEED
+            self.centered_count = 0
+        
+        # Publish velocity command
+        twist = Twist()
+        twist.linear.x = speed
+        twist.angular.z = turn
+        self.cmd_vel_publisher.publish(twist)
+        
+        self.get_logger().info(
+            f"APPROACHING: size={barrel_size:.0f}, y={barrel_y:.0f}, speed={speed:.2f}, turn={turn:.2f}",
+            throttle_duration_sec=0.5
+        )
 
     def positioning(self):
         """POSITIONING state: Maneuver barrel behind robot."""
