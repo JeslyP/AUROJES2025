@@ -277,7 +277,7 @@ class RobotController(Node):
                     self.get_logger().info(f"Turn Complete. Backing up for 2.0s...")
 
             elif self.collect_phase == CollectPhase.BACKUP:
-                BACKUP_TIME = 1.5 
+                BACKUP_TIME = 1.5
                 if t < BACKUP_TIME:
                     twist.linear.x = -0.15 
                     self.cmd_vel_pub.publish(twist)
@@ -316,7 +316,7 @@ class RobotController(Node):
                 self.service_future = None
 
         # ========================================================
-        # STATE 5: DELIVERING (MULTI-ZONE: FILLING BOXES)
+        # STATE 5: DELIVERING (BACKWARDS FILL)
         # ========================================================
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
@@ -342,19 +342,24 @@ class RobotController(Node):
                 
                 # Local index inside the zone (0-15)
                 local_index = total_count % ZONE_CAPACITY
+                
+                # --- REVERSE LOGIC (Backwards Fill) ---
+                # We calculate coordinates based on the INVERTED index.
+                # Barrel 1 (index 0) goes to the LAST spot (index 15).
+                fill_index = (ZONE_CAPACITY - 1) - local_index
 
                 # --- CALCULATE GRID POSITION ---
                 # col moves along Y (0 to 3) -> Moves Down (Negative Y)
-                col = local_index % ROW_LENGTH 
+                col = fill_index % ROW_LENGTH 
                 
                 # row moves along X (0 to 3) -> Moves Left (Negative X)
-                row = local_index // ROW_LENGTH 
+                row = fill_index // ROW_LENGTH 
 
                 # We subtract because zones grow towards smaller X and smaller Y
                 target_x = current_zone['start_x'] - (row * SPACING)
                 target_y = current_zone['start_y'] - (col * SPACING)
 
-                self.get_logger().info(f"🚚 Barrel #{total_count + 1} -> {current_zone['name']} (Grid {col},{row}) at ({target_x:.2f}, {target_y:.2f})")
+                self.get_logger().info(f"🚚 Barrel #{total_count + 1} -> {current_zone['name']} (Fill Slot {fill_index}) at ({target_x:.2f}, {target_y:.2f})")
                 
                 # Send Goal
                 goal = PoseStamped()
