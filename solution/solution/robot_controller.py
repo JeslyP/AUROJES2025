@@ -304,10 +304,17 @@ class RobotController(Node):
                         self.get_logger().info("🎉 PICKUP SUCCESS!")
                         self.holding_barrel = True
                         self.set_mask(True) 
+                        
+                        # --- FIX: CLEAR GHOST OBSTACLES ---
+                        self.navigator.clearAllCostmaps() 
+                        # ----------------------------------
+
                         self.state = State.DELIVERING 
                         self.nav_goal_sent = False
                     else:
                         self.get_logger().warn(f"❌ Pickup Failed: {res.message}")
+                        # Force clear here too, just in case it's stuck on a ghost
+                        self.navigator.clearAllCostmaps()
                         self.state = State.SEARCHING 
                         self.nav_goal_sent = False
                 except Exception as e:
@@ -386,14 +393,13 @@ class RobotController(Node):
             
             # --- 1. REVERSE MANEUVER ---
             t = (self.get_clock().now() - self.offload_start_time).nanoseconds / 1e9
-            REVERSE_TIME = .5 # Seconds to reverse
+            REVERSE_TIME = 1.8 
             
             if t < REVERSE_TIME:
                 twist = Twist()
-                twist.linear.x = -0.15 # Drive backwards
+                twist.linear.x = -0.15 
                 self.cmd_vel_pub.publish(twist)
-                return # Don't drop yet!
-            
+                return 
             else:
                 self.stop_robot()
             
@@ -411,6 +417,11 @@ class RobotController(Node):
                         self.set_mask(False) 
                         self.holding_barrel = False
                         self.barrels_collected += 1
+                        
+                        # --- FIX: CLEAR MAP SO WE DON'T HIT GHOSTS ---
+                        self.navigator.clearAllCostmaps()
+                        # ---------------------------------------------
+
                         self.state = State.SEARCHING 
                         self.nav_goal_sent = False
                         self.current_wp_index = 3 
