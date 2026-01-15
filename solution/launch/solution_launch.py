@@ -159,7 +159,7 @@ def generate_launch_description():
     
     declare_experiment_duration_cmd = DeclareLaunchArgument(
         'experiment_duration',
-        default_value='840.0',
+        default_value='3600.0',
         description='Experiment duration in seconds of simulation time')
 
     declare_use_rviz_cmd = DeclareLaunchArgument(
