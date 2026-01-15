@@ -322,7 +322,7 @@ class RobotController(Node):
                 self.service_future = None
 
         # ========================================================
-        # STATE 5: DELIVERING (FACING SOUTH)
+        # STATE 5: DELIVERING (FACING WEST)
         # ========================================================
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
@@ -346,12 +346,10 @@ class RobotController(Node):
                 current_zone = zones[zone_index]
                 local_index = total_count % ZONE_CAPACITY
                 
-                # --- GRID CALCULATION (Keep your existing logic) ---
+                # --- GRID CALCULATION ---
                 col = local_index % ROW_LENGTH 
                 row = local_index // ROW_LENGTH 
 
-                # X: Subtract (12 -> 10)
-                # Y: Add (-8.3 -> -5.9)
                 target_x = current_zone['start_x'] - (row * SPACING_X)
                 target_y = current_zone['start_y'] + (col * SPACING_Y)
 
@@ -364,10 +362,10 @@ class RobotController(Node):
                 goal.pose.position.x = target_x
                 goal.pose.position.y = target_y
                 
-                # --- ORIENTATION: FACE SOUTH (-90 Degrees) ---
-                # z = sin(-45) = -0.707, w = cos(-45) = 0.707
-                goal.pose.orientation.z = -0.7071
-                goal.pose.orientation.w = 0.7071
+                # --- ORIENTATION: FACE WEST (180 Degrees) ---
+                # Robot faces "Left", so reversing pushes it "Right" (East) into the zone
+                goal.pose.orientation.z = 1.0
+                goal.pose.orientation.w = 0.0
                 
                 self.navigator.goToPose(goal)
                 self.nav_goal_sent = True
