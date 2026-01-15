@@ -79,6 +79,7 @@ class RobotController(Node):
         self.phase_start_time = None
         self.service_future = None
         self.barrels_collected = 0 
+        self.offload_start_time = None # <--- NEW: Timer for reversing
 
         # LiDAR Data
         self.front_dist = float('inf')
@@ -277,7 +278,7 @@ class RobotController(Node):
                     self.get_logger().info(f"Turn Complete. Backing up for 2.0s...")
 
             elif self.collect_phase == CollectPhase.BACKUP:
-                BACKUP_TIME = 1.5
+                BACKUP_TIME = 1.5 
                 if t < BACKUP_TIME:
                     twist.linear.x = -0.15 
                     self.cmd_vel_pub.publish(twist)
@@ -344,15 +345,11 @@ class RobotController(Node):
                 local_index = total_count % ZONE_CAPACITY
                 
                 # --- REVERSE LOGIC (Backwards Fill) ---
-                # We calculate coordinates based on the INVERTED index.
                 # Barrel 1 (index 0) goes to the LAST spot (index 15).
                 fill_index = (ZONE_CAPACITY - 1) - local_index
 
                 # --- CALCULATE GRID POSITION ---
-                # col moves along Y (0 to 3) -> Moves Down (Negative Y)
                 col = fill_index % ROW_LENGTH 
-                
-                # row moves along X (0 to 3) -> Moves Left (Negative X)
                 row = fill_index // ROW_LENGTH 
 
                 # We subtract because zones grow towards smaller X and smaller Y
@@ -374,17 +371,33 @@ class RobotController(Node):
             
             elif self.navigator.isTaskComplete():
                 if self.navigator.getResult() == TaskResult.SUCCEEDED:
-                    self.get_logger().info("Arrived. Offloading...")
+                    self.get_logger().info("Arrived. Starting Reverse Park...")
                     self.state = State.OFFLOADING
+                    self.offload_start_time = self.get_clock().now() # START REVERSE TIMER
                     self.service_future = None
                 else:
                     self.get_logger().warn("Delivery Failed. Retrying...")
                     self.nav_goal_sent = False 
 
         # ========================================================
-        # STATE 6: OFFLOADING
+        # STATE 6: OFFLOADING (WITH REVERSE PARK)
         # ========================================================
         elif self.state == State.OFFLOADING:
+            
+            # --- 1. REVERSE MANEUVER ---
+            t = (self.get_clock().now() - self.offload_start_time).nanoseconds / 1e9
+            REVERSE_TIME = .5 # Seconds to reverse
+            
+            if t < REVERSE_TIME:
+                twist = Twist()
+                twist.linear.x = -0.15 # Drive backwards
+                self.cmd_vel_pub.publish(twist)
+                return # Don't drop yet!
+            
+            else:
+                self.stop_robot()
+            
+            # --- 2. DROP BARREL ---
             if self.service_future is None:
                 req = ItemRequest.Request()
                 req.robot_id = self.robot_name
@@ -397,10 +410,7 @@ class RobotController(Node):
                         self.get_logger().info("📦 OFFLOAD SUCCESS!")
                         self.set_mask(False) 
                         self.holding_barrel = False
-                        
-                        # Increment Counter!
                         self.barrels_collected += 1
-                        
                         self.state = State.SEARCHING 
                         self.nav_goal_sent = False
                         self.current_wp_index = 3 
