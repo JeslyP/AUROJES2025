@@ -47,7 +47,7 @@ def robot_controller_actions(context : LaunchContext):
                 # prefix=['lxterminal -e'], # Opens in new window, should work under auro-vnc, auro-wsl or X11 native.
                 output='screen',
                 # output='log', # Instead use to log to a file under ~/.ros/log/.
-                parameters=[initial_poses[robot_name]]),
+                parameters=[initial_poses[robot_name], {'use_sim_time': True}]),
 
             # Node(
             #     package='turtlebot3_gazebo',
@@ -225,12 +225,12 @@ def generate_launch_description():
 
     # RViz2 configuration, which you can change if needed, by pointing it to your solution package,
     # rather than using the files under the assessment package.
-    rviz_config = PathJoinSubstitution([FindPackageShare('assessment'), 'rviz', 'namespaced.rviz'])
+    rviz_config = PathJoinSubstitution([FindPackageShare('assessment'), 'rviz', 'namespaced_nav2.rviz'])
     rviz_windows = PathJoinSubstitution([FindPackageShare('assessment'), 'config', 'rviz_windows.yaml'])
     
     # Nav2 parameters. Similarly, can be changed by pointing it to your solution package.
     map = PathJoinSubstitution([FindPackageShare('solution'), 'config', 'map2.yaml'])
-    params = PathJoinSubstitution([FindPackageShare('assessment'), 'params', 'nav2_params_namespaced.yaml'])
+    params = PathJoinSubstitution([FindPackageShare('solution'), 'params', 'custom_nav2_params_namespaced.yaml'])
     
     assessment_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
