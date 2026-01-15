@@ -322,17 +322,17 @@ class RobotController(Node):
                 self.service_future = None
 
         # ========================================================
-        # STATE 5: DELIVERING (NEW COORDINATES)
+        # STATE 5: DELIVERING (FACING SOUTH)
         # ========================================================
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
                 # --- ZONE CONFIGURATION ---
-                SPACING_X = 0.6 # Spacing along rows (Front to Back)
-                SPACING_Y = 0.7 # Spacing along columns (Left to Right)
+                SPACING_X = 0.6 
+                SPACING_Y = 0.7 
                 ROW_LENGTH = 4  
                 ZONE_CAPACITY = 16
                 
-                # YOUR NEW START CORNERS (Top Right in your description)
+                # YOUR COORDINATES (Zone B Start: Bottom-Right Corner)
                 zones = [
                     # Zone B (Barrels 1-16)
                     {'name': 'Zone B', 'start_x': 12.0, 'start_y': -8.3},
@@ -342,24 +342,20 @@ class RobotController(Node):
 
                 # --- DETERMINE TARGET ---
                 total_count = self.barrels_collected
-                
-                # Select Zone
                 zone_index = (total_count // ZONE_CAPACITY) % len(zones)
                 current_zone = zones[zone_index]
                 local_index = total_count % ZONE_CAPACITY
                 
-                # --- GRID CALCULATION (Normal Order) ---
-                # "One row" (along Y) = 4 barrels
-                col = local_index % ROW_LENGTH  # 0,1,2,3 (Moves Y)
-                row = local_index // ROW_LENGTH # 0,1,2,3 (Moves X)
+                # --- GRID CALCULATION (Keep your existing logic) ---
+                col = local_index % ROW_LENGTH 
+                row = local_index // ROW_LENGTH 
 
-                # YOUR LOGIC:
-                # X: 12.0 -> 10.1 (SUBTRACT)
-                # Y: -8.3 -> -5.9 (ADD)
+                # X: Subtract (12 -> 10)
+                # Y: Add (-8.3 -> -5.9)
                 target_x = current_zone['start_x'] - (row * SPACING_X)
                 target_y = current_zone['start_y'] + (col * SPACING_Y)
 
-                self.get_logger().info(f"🚚 Barrel #{total_count + 1} -> {current_zone['name']} (Grid {col},{row}) at ({target_x:.2f}, {target_y:.2f})")
+                self.get_logger().info(f"🚚 Barrel #{total_count + 1} -> {current_zone['name']} at ({target_x:.2f}, {target_y:.2f})")
                 
                 # Send Goal
                 goal = PoseStamped()
@@ -367,7 +363,11 @@ class RobotController(Node):
                 goal.header.stamp = self.navigator.get_clock().now().to_msg()
                 goal.pose.position.x = target_x
                 goal.pose.position.y = target_y
-                goal.pose.orientation.w = 1.0
+                
+                # --- ORIENTATION: FACE SOUTH (-90 Degrees) ---
+                # z = sin(-45) = -0.707, w = cos(-45) = 0.707
+                goal.pose.orientation.z = -0.7071
+                goal.pose.orientation.w = 0.7071
                 
                 self.navigator.goToPose(goal)
                 self.nav_goal_sent = True
