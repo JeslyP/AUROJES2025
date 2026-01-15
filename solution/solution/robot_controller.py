@@ -182,19 +182,29 @@ class RobotController(Node):
     def control_loop(self):
         
         # ========================================================
-        # STATE 1: SEARCHING
+        # STATE 1: SEARCHING (With Minimum Size Filter)
         # ========================================================
         if self.state == State.SEARCHING:
             if self.search_enabled:
                 best_barrel = self.get_best_barrel()
+                
+                # --- NEW: IGNORE DISTANT TARGETS ---
+                # 162 and 2994 are too small. We wait until we are closer (>5000).
+                MIN_DETECT_SIZE = 5000 
+                
                 if best_barrel and not self.holding_barrel:
-                    self.get_logger().info(f"👀 BARREL SPOTTED! Size: {best_barrel.size}")
-                    self.navigator.cancelTask()
-                    self.stop_robot()
-                    self.state = State.APPROACHING
-                    self.collect_phase = CollectPhase.ALIGN 
-                    self.nav_goal_sent = False
-                    return
+                    if best_barrel.size > MIN_DETECT_SIZE:
+                        self.get_logger().info(f"👀 BARREL SPOTTED! Size: {best_barrel.size} -> ATTACKING!")
+                        self.navigator.cancelTask()
+                        self.stop_robot()
+                        self.state = State.APPROACHING
+                        self.collect_phase = CollectPhase.ALIGN 
+                        self.nav_goal_sent = False
+                        return
+                    else:
+                        # Log nicely so we know it sees it but is waiting
+                        # self.get_logger().info(f"Ignoring distant barrel (Size: {best_barrel.size})... Driving closer.")
+                        pass
 
             if not self.nav_goal_sent:
                 wp = self.waypoints[self.current_wp_index]
