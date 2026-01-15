@@ -277,7 +277,7 @@ class RobotController(Node):
                     self.get_logger().info(f"Turn Complete. Backing up for 2.0s...")
 
             elif self.collect_phase == CollectPhase.BACKUP:
-                BACKUP_TIME = 2.0 
+                BACKUP_TIME = 1.5 
                 if t < BACKUP_TIME:
                     twist.linear.x = -0.15 
                     self.cmd_vel_pub.publish(twist)
