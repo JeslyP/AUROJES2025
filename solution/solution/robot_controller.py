@@ -79,7 +79,7 @@ class RobotController(Node):
         self.phase_start_time = None
         self.service_future = None
         self.barrels_collected = 0 
-        self.offload_start_time = None # <--- NEW: Timer for reversing
+        self.offload_start_time = None 
 
         # LiDAR Data
         self.front_dist = float('inf')
@@ -125,7 +125,6 @@ class RobotController(Node):
         req = SetParameters.Request()
         val_enabled = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=enabled)
         
-        # 100-260 degrees (Wide Blind Spot)
         val_start = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=100)
         val_end = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=260)
 
@@ -313,7 +312,6 @@ class RobotController(Node):
                         self.nav_goal_sent = False
                     else:
                         self.get_logger().warn(f"❌ Pickup Failed: {res.message}")
-                        # Force clear here too, just in case it's stuck on a ghost
                         self.navigator.clearAllCostmaps()
                         self.state = State.SEARCHING 
                         self.nav_goal_sent = False
@@ -324,21 +322,22 @@ class RobotController(Node):
                 self.service_future = None
 
         # ========================================================
-        # STATE 5: DELIVERING (BACKWARDS FILL)
+        # STATE 5: DELIVERING (NEW COORDINATES)
         # ========================================================
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
                 # --- ZONE CONFIGURATION ---
-                SPACING = 0.6   # 60cm spacing
-                ROW_LENGTH = 4  # 4 barrels per row/Y-axis
+                SPACING_X = 0.6 # Spacing along rows (Front to Back)
+                SPACING_Y = 0.7 # Spacing along columns (Left to Right)
+                ROW_LENGTH = 4  
                 ZONE_CAPACITY = 16
                 
-                # Zone Definitions (Top Left Corners)
+                # YOUR NEW START CORNERS (Top Right in your description)
                 zones = [
                     # Zone B (Barrels 1-16)
-                    {'name': 'Zone B', 'start_x': 12.0, 'start_y': -5.9},
+                    {'name': 'Zone B', 'start_x': 12.0, 'start_y': -8.3},
                     # Zone A (Barrels 17-32)
-                    {'name': 'Zone A', 'start_x': 12.0, 'start_y': -12.1}
+                    {'name': 'Zone A', 'start_x': 12.0, 'start_y': -14.6}
                 ]
 
                 # --- DETERMINE TARGET ---
@@ -347,23 +346,20 @@ class RobotController(Node):
                 # Select Zone
                 zone_index = (total_count // ZONE_CAPACITY) % len(zones)
                 current_zone = zones[zone_index]
-                
-                # Local index inside the zone (0-15)
                 local_index = total_count % ZONE_CAPACITY
                 
-                # --- REVERSE LOGIC (Backwards Fill) ---
-                # Barrel 1 (index 0) goes to the LAST spot (index 15).
-                fill_index = (ZONE_CAPACITY - 1) - local_index
+                # --- GRID CALCULATION (Normal Order) ---
+                # "One row" (along Y) = 4 barrels
+                col = local_index % ROW_LENGTH  # 0,1,2,3 (Moves Y)
+                row = local_index // ROW_LENGTH # 0,1,2,3 (Moves X)
 
-                # --- CALCULATE GRID POSITION ---
-                col = fill_index % ROW_LENGTH 
-                row = fill_index // ROW_LENGTH 
+                # YOUR LOGIC:
+                # X: 12.0 -> 10.1 (SUBTRACT)
+                # Y: -8.3 -> -5.9 (ADD)
+                target_x = current_zone['start_x'] - (row * SPACING_X)
+                target_y = current_zone['start_y'] + (col * SPACING_Y)
 
-                # We subtract because zones grow towards smaller X and smaller Y
-                target_x = current_zone['start_x'] - (row * SPACING)
-                target_y = current_zone['start_y'] - (col * SPACING)
-
-                self.get_logger().info(f"🚚 Barrel #{total_count + 1} -> {current_zone['name']} (Fill Slot {fill_index}) at ({target_x:.2f}, {target_y:.2f})")
+                self.get_logger().info(f"🚚 Barrel #{total_count + 1} -> {current_zone['name']} (Grid {col},{row}) at ({target_x:.2f}, {target_y:.2f})")
                 
                 # Send Goal
                 goal = PoseStamped()
@@ -380,7 +376,7 @@ class RobotController(Node):
                 if self.navigator.getResult() == TaskResult.SUCCEEDED:
                     self.get_logger().info("Arrived. Starting Reverse Park...")
                     self.state = State.OFFLOADING
-                    self.offload_start_time = self.get_clock().now() # START REVERSE TIMER
+                    self.offload_start_time = self.get_clock().now() 
                     self.service_future = None
                 else:
                     self.get_logger().warn("Delivery Failed. Retrying...")
