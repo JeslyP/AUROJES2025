@@ -322,22 +322,22 @@ class RobotController(Node):
                 self.service_future = None
 
         # ========================================================
-        # STATE 5: DELIVERING (FACING WEST)
+        # STATE 5: DELIVERING (FACING WEST + SAFETY BUFFER)
         # ========================================================
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
                 # --- ZONE CONFIGURATION ---
                 SPACING_X = 0.6 
-                SPACING_Y = 0.7 
+                SPACING_Y = 0.6 # Reduced to 0.6 to avoid hitting the top wall
                 ROW_LENGTH = 4  
                 ZONE_CAPACITY = 16
                 
-                # YOUR COORDINATES (Zone B Start: Bottom-Right Corner)
+                # SAFETY TWEAK: Moved x from 12.0 to 11.7 to avoid hitting back wall
                 zones = [
                     # Zone B (Barrels 1-16)
-                    {'name': 'Zone B', 'start_x': 12.0, 'start_y': -8.3},
+                    {'name': 'Zone B', 'start_x': 11.7, 'start_y': -8.3},
                     # Zone A (Barrels 17-32)
-                    {'name': 'Zone A', 'start_x': 12.0, 'start_y': -14.6}
+                    {'name': 'Zone A', 'start_x': 11.7, 'start_y': -14.6}
                 ]
 
                 # --- DETERMINE TARGET ---
@@ -363,7 +363,6 @@ class RobotController(Node):
                 goal.pose.position.y = target_y
                 
                 # --- ORIENTATION: FACE WEST (180 Degrees) ---
-                # Robot faces "Left", so reversing pushes it "Right" (East) into the zone
                 goal.pose.orientation.z = 1.0
                 goal.pose.orientation.w = 0.0
                 
