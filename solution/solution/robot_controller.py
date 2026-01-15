@@ -228,33 +228,45 @@ class RobotController(Node):
                 self.nav_goal_sent = False
 
         # ========================================================
-        # STATE 2: APPROACHING
+        # STATE 2: APPROACHING (WITH CENTER LOCK)
         # ========================================================
         elif self.state == State.APPROACHING:
-            target = self.get_best_barrel()
+            CAMERA_CENTER = 320
+            STOP_DISTANCE = 0.55
+            MIN_SIZE = 5000 # Keep this consistent with detection
+
+            # --- LOCK-ON LOGIC ---
+            # Instead of largest, pick the one closest to the center of the screen.
+            # This prevents switching targets if two are nearby.
+            if self.barrels:
+                # Find barrel with smallest distance to center (abs(x - 320))
+                target = min(self.barrels, key=lambda b: abs(b.x - CAMERA_CENTER))
+            else:
+                target = None
+
             if not target:
                 self.get_logger().warn("Lost barrel! Back to patrol.")
                 self.state = State.SEARCHING
                 return
 
-            CAMERA_CENTER = 320
-            STOP_DISTANCE = 0.55
-            MIN_SIZE = 60000
-
             twist = Twist()
             error = target.x - CAMERA_CENTER
 
+            # 1. ALIGN PHASE (Steer only)
             if self.collect_phase == CollectPhase.ALIGN:
                 if abs(error) > 15:
                     twist.angular.z = -0.002 * error
+                    # Clamp speed
                     twist.angular.z = max(-0.5, min(0.5, twist.angular.z))
                     self.cmd_vel_pub.publish(twist)
                 else:
                     self.stop_robot()
                     self.collect_phase = CollectPhase.APPROACH
 
+            # 2. APPROACH PHASE (Drive + Steer)
             elif self.collect_phase == CollectPhase.APPROACH:
-                if self.front_dist < STOP_DISTANCE and target.size > MIN_SIZE:
+                # Check if we are close enough OR the barrel is huge (close)
+                if self.front_dist < STOP_DISTANCE or target.size > 65000:
                     self.stop_robot()
                     self.get_logger().info("✅ Reached Barrel! Starting positioning...")
                     self.state = State.POSITIONING
@@ -262,9 +274,14 @@ class RobotController(Node):
                     self.phase_start_time = self.get_clock().now()
                 else:
                     twist.linear.x = 0.15 
+                    
+                    # Steer to keep it locked in center
                     steer = -0.0015 * error
+                    
+                    # Wall Avoidance (Push away from walls)
                     if self.left_dist < 0.35: steer -= 0.3 
                     elif self.right_dist < 0.35: steer += 0.3 
+                    
                     twist.angular.z = steer
                     self.cmd_vel_pub.publish(twist)
 
