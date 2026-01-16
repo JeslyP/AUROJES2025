@@ -214,7 +214,7 @@ class RobotController(Node):
                     goal.pose.orientation.z = -0.7071
                     goal.pose.orientation.w = 0.7071
                 else:
-                    # Face East (Standard)
+                    # Face East
                     goal.pose.orientation.z = 0.0
                     goal.pose.orientation.w = 1.0
                 # ---------------------------------------
@@ -223,9 +223,12 @@ class RobotController(Node):
                 self.nav_goal_sent = True
             
             elif self.navigator.isTaskComplete():
+                # --- THIS IS WHERE SEARCH GETS TURNED BACK ON ---
                 if self.current_wp_index == 3:
                     self.search_enabled = True
                     self.get_logger().info("⚠️ SEARCH ACTIVATED ⚠️")
+                # ------------------------------------------------
+                
                 self.current_wp_index += 1
                 if self.current_wp_index >= len(self.waypoints):
                     self.current_wp_index = 3 
@@ -341,8 +344,8 @@ class RobotController(Node):
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
                 # --- ZONE CONFIGURATION ---
-                SPACING_X = 0.8 
-                SPACING_Y = 0.8 # Reduced to 0.6 to avoid hitting the top wall
+                SPACING_X = 0.9 
+                SPACING_Y = 0.9 # Reduced to 0.6 to avoid hitting the top wall
                 ROW_LENGTH = 4  
                 ZONE_CAPACITY = 16
                 
@@ -457,10 +460,12 @@ class RobotController(Node):
                 time.sleep(0.5)
                 self.navigator.clearAllCostmaps()
                 
+                # --- KEY FIX: DISABLE SEARCH UNTIL WAYPOINT 3 ---
                 self.state = State.SEARCHING 
                 self.nav_goal_sent = False
                 self.current_wp_index = 3 
-                # -----------------------------------------
+                self.search_enabled = False # <--- DISABLE SEARCH HERE
+                # ------------------------------------------------
 
     def destroy_node(self):
         self.stop_robot()
