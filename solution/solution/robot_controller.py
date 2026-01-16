@@ -204,7 +204,18 @@ class RobotController(Node):
                 goal.header.stamp = self.navigator.get_clock().now().to_msg()
                 goal.pose.position.x = wp['x']
                 goal.pose.position.y = wp['y']
-                goal.pose.orientation.w = 1.0
+                
+                # --- SPECIAL LOGIC FOR LEFT CORRIDOR ---
+                if wp['name'] == 'Left Corridor Top':
+                    # Face South (Down the corridor)
+                    goal.pose.orientation.z = -0.7071
+                    goal.pose.orientation.w = 0.7071
+                else:
+                    # Face East (Standard)
+                    goal.pose.orientation.z = 0.0
+                    goal.pose.orientation.w = 1.0
+                # ---------------------------------------
+
                 self.navigator.goToPose(goal)
                 self.nav_goal_sent = True
             
