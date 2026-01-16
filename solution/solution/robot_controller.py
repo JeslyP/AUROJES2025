@@ -1,4 +1,5 @@
 import sys
+import time
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -27,6 +28,7 @@ class State(Enum):
     PICKING_UP = 3
     DELIVERING = 4
     OFFLOADING = 5
+    CLEARING_SPACE = 6  # <--- NEW STATE: Drives forward after drop
 
 class CollectPhase(Enum):
     ALIGN = 0
@@ -80,6 +82,7 @@ class RobotController(Node):
         self.service_future = None
         self.barrels_collected = 0 
         self.offload_start_time = None 
+        self.forward_start_time = None # <--- NEW TIMER
 
         # LiDAR Data
         self.front_dist = float('inf')
@@ -417,24 +420,47 @@ class RobotController(Node):
                 try:
                     res = self.service_future.result()
                     if res.success:
-                        self.get_logger().info("📦 OFFLOAD SUCCESS!")
+                        self.get_logger().info("📦 OFFLOAD SUCCESS! Driving forward to clear space...")
                         self.set_mask(False) 
                         self.holding_barrel = False
                         self.barrels_collected += 1
                         
-                        # --- FIX: CLEAR MAP SO WE DON'T HIT GHOSTS ---
-                        self.navigator.clearAllCostmaps()
-                        # ---------------------------------------------
-
-                        self.state = State.SEARCHING 
-                        self.nav_goal_sent = False
-                        self.current_wp_index = 3 
+                        # --- NEW: GO TO CLEARING STATE INSTEAD OF SEARCHING ---
+                        self.state = State.CLEARING_SPACE
+                        self.forward_start_time = self.get_clock().now()
+                        # ------------------------------------------------------
                     else:
                         self.get_logger().warn("Offload Failed.")
                         self.service_future = None 
                 except Exception as e:
                     self.get_logger().error(f"Offload error: {e}")
                 self.service_future = None
+
+        # ========================================================
+        # STATE 7: CLEARING SPACE (NEW)
+        # ========================================================
+        elif self.state == State.CLEARING_SPACE:
+            
+            # --- 1. DRIVE FORWARD FOR 1.0 SECONDS ---
+            t = (self.get_clock().now() - self.forward_start_time).nanoseconds / 1e9
+            FORWARD_TIME = 1.0 
+
+            if t < FORWARD_TIME:
+                twist = Twist()
+                twist.linear.x = 0.15 # Move forward
+                self.cmd_vel_pub.publish(twist)
+            else:
+                self.stop_robot()
+                self.get_logger().info("✅ Space cleared. Resuming Patrol.")
+                
+                # --- 2. CLEAR MAP AND RESUME SEARCHING ---
+                time.sleep(0.5)
+                self.navigator.clearAllCostmaps()
+                
+                self.state = State.SEARCHING 
+                self.nav_goal_sent = False
+                self.current_wp_index = 3 
+                # -----------------------------------------
 
     def destroy_node(self):
         self.stop_robot()
@@ -454,4 +480,4 @@ def main(args=None):
         rclpy.try_shutdown()
 
 if __name__ == '__main__':
-    main() 
+    main()
