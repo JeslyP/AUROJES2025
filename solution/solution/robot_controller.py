@@ -94,8 +94,8 @@ class RobotController(Node):
         self.waypoints = [
             {'x': 0.053, 'y': 7.213, 'name': 'Start Area'},
             {'x': 5.21, 'y': 5.17, 'name': 'Right Corridor Bottom'},
-            {'x': 9.351, 'y': 4.677, 'name': 'Right Corridor Top'}, 
-            {'x': 9.755, 'y': 8.841, 'name': 'Left Corridor Top'},
+            {'x': 9.351, 'y': 4.7, 'name': 'Right Corridor Top'}, 
+            {'x': 8.000, 'y': 9.041, 'name': 'Left Corridor Top'},
             {'x': 10.050, 'y': 14.850, 'name': 'Big Room Entrance'},
             {'x': 6.150, 'y': 14.811, 'name': 'Big Room Bottom Right'},
             {'x': 6.426, 'y': 19.251, 'name': 'Big Room Bottom Center'},
@@ -208,16 +208,16 @@ class RobotController(Node):
                 goal.pose.position.x = wp['x']
                 goal.pose.position.y = wp['y']
                 
-                # --- SPECIAL LOGIC FOR LEFT CORRIDOR ---
+                # # --- SPECIAL LOGIC FOR LEFT CORRIDOR ---
                 if wp['name'] == 'Left Corridor Top':
                     # Face South (Down the corridor)
-                    goal.pose.orientation.z = -0.7071
-                    goal.pose.orientation.w = 0.7071
+                    goal.pose.orientation.z = 1.0
+                    goal.pose.orientation.w = 0.0
                 else:
                     # Face East
                     goal.pose.orientation.z = 0.0
                     goal.pose.orientation.w = 1.0
-                # ---------------------------------------
+                # # ---------------------------------------
 
                 self.navigator.goToPose(goal)
                 self.nav_goal_sent = True
@@ -344,8 +344,8 @@ class RobotController(Node):
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
                 # --- ZONE CONFIGURATION ---
-                SPACING_X = 0.9 
-                SPACING_Y = 0.9 # Reduced to 0.6 to avoid hitting the top wall
+                SPACING_X = 0.7 
+                SPACING_Y = 0.7 # Reduced to 0.6 to avoid hitting the top wall
                 ROW_LENGTH = 4  
                 ZONE_CAPACITY = 16
                 
