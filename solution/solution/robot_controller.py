@@ -327,8 +327,8 @@ class RobotController(Node):
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
                 # --- ZONE CONFIGURATION ---
-                SPACING_X = 0.6 
-                SPACING_Y = 0.6 # Reduced to 0.6 to avoid hitting the top wall
+                SPACING_X = 0.8 
+                SPACING_Y = 0.8 # Reduced to 0.6 to avoid hitting the top wall
                 ROW_LENGTH = 4  
                 ZONE_CAPACITY = 16
                 
