@@ -49,9 +49,9 @@ class RobotController(Node):
             self.robot_name = 'robot1'
 
         # 2. SETUP NAVIGATOR
-        self.navigator = BasicNavigator()
+        self.navigator = BasicNavigator(namespace=f'/{self.robot_name}')
         self.set_initial_pose()
-        self.navigator.waitUntilNav2Active()
+        self.navigator.waitUntilNav2Active(localizer='amcl')
 
         # 3. SENSORS
         self.create_subscription(BarrelList, 'barrels', self.barrel_callback, 10)
@@ -125,8 +125,8 @@ class RobotController(Node):
         req = SetParameters.Request()
         val_enabled = ParameterValue(type=ParameterType.PARAMETER_BOOL, bool_value=enabled)
         
-        val_start = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=100)
-        val_end = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=260)
+        val_start = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=80)
+        val_end = ParameterValue(type=ParameterType.PARAMETER_INTEGER, integer_value=280)
 
         req.parameters = [
             Parameter(name='mask_enabled', value=val_enabled),
@@ -305,6 +305,8 @@ class RobotController(Node):
                         self.set_mask(True) 
                         
                         # --- FIX: CLEAR GHOST OBSTACLES ---
+                        import time
+                        time.sleep(0.5)  # Small delay to ensure pickup is registered
                         self.navigator.clearAllCostmaps() 
                         # ----------------------------------
 
@@ -412,6 +414,8 @@ class RobotController(Node):
                         self.barrels_collected += 1
                         
                         # --- FIX: CLEAR MAP SO WE DON'T HIT GHOSTS ---
+                        import time
+                        time.sleep(0.5)
                         self.navigator.clearAllCostmaps()
                         # ---------------------------------------------
 
