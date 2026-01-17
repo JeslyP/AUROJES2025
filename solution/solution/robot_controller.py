@@ -14,8 +14,7 @@ from sensor_msgs.msg import LaserScan
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 # Custom Interfaces
-# --- MODIFIED: Added RadiationLevels ---
-from assessment_interfaces.msg import BarrelList, BarrelHolders, RadiationLevels
+from assessment_interfaces.msg import BarrelList, BarrelHolders, RadiationList
 from auro_interfaces.srv import ItemRequest
 
 # For Dynamic Parameters (LiDAR Mask)
@@ -29,14 +28,19 @@ class State(Enum):
     PICKING_UP = 3
     DELIVERING = 4
     OFFLOADING = 5
-    CLEARING_SPACE = 6  # <--- NEW STATE: Drives forward after drop
-    DECONTAMINATING = 7 # <--- NEW STATE: Cleans robot
+    CLEARING_SPACE = 6
+    DECONTAMINATING = 7  # Go to cyan zone and decontaminate
 
 class CollectPhase(Enum):
     ALIGN = 0
     APPROACH = 1
     TURN_AROUND = 2
     BACKUP = 3
+
+class DecontaminatePhase(Enum):
+    NAVIGATING = 0
+    REVERSING = 1
+    CALLING_SERVICE = 2
 
 class RobotController(Node):
 
@@ -61,8 +65,7 @@ class RobotController(Node):
         self.create_subscription(BarrelList, 'barrels', self.barrel_callback, 10)
         self.create_subscription(LaserScan, 'scan_filtered', self.scan_callback, 10)
         self.create_subscription(BarrelHolders, '/barrel_holders', self.holders_callback, 10)
-        # --- NEW: Subscribe to Radiation Levels ---
-        self.create_subscription(RadiationLevels, '/radiation_levels', self.radiation_callback, 10)
+        self.create_subscription(RadiationList, '/radiation_levels', self.radiation_callback, 10)
 
         # 4. PUBLISHERS
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -71,8 +74,7 @@ class RobotController(Node):
         self.cb_group = ReentrantCallbackGroup()
         self.pickup_client = self.create_client(ItemRequest, '/pick_up_item', callback_group=self.cb_group)
         self.offload_client = self.create_client(ItemRequest, '/offload_item', callback_group=self.cb_group)
-        # --- NEW: Decontamination Client ---
-        self.decon_client = self.create_client(ItemRequest, '/decontaminate', callback_group=self.cb_group)
+        self.decontaminate_client = self.create_client(ItemRequest, '/decontaminate', callback_group=self.cb_group)
         self.mask_client = self.create_client(SetParameters, f'/{self.robot_name}/dynamic_mask/set_parameters', callback_group=self.cb_group)
         
         if not self.pickup_client.wait_for_service(timeout_sec=2.0):
@@ -81,18 +83,20 @@ class RobotController(Node):
         # 6. DATA & STATE
         self.state = State.SEARCHING
         self.collect_phase = CollectPhase.ALIGN
+        self.decontaminate_phase = DecontaminatePhase.NAVIGATING
         self.barrels = []
         self.holding_barrel = False
+        self.radiation_level = 0  # Track radiation level
         self.search_enabled = False 
         self.phase_start_time = None
         self.service_future = None
         self.barrels_collected = 0 
         self.offload_start_time = None 
-        self.forward_start_time = None # <--- NEW TIMER
-        
-        # --- NEW: Radiation Data ---
-        self.radiation_level = 0.0
-        self.DECON_THRESHOLD = 300.0 
+        self.forward_start_time = None
+        self.decontaminate_start_time = None
+
+        # Decontamination threshold
+        self.DECONTAMINATION_THRESHOLD = 300
 
         # LiDAR Data
         self.front_dist = float('inf')
@@ -117,6 +121,9 @@ class RobotController(Node):
             {'x': 10.134, 'y': 19.612, 'name': 'Big Room Center'},
             {'x': 10.050, 'y': 14.850, 'name': 'Big Room Entrance (Exit)'},
         ]
+
+        # Decontamination zone (cyan zone)
+        self.decontamination_zone = {'x': 9.58, 'y': -0.33}
         
         self.current_wp_index = 1 
         self.nav_goal_sent = False
@@ -152,13 +159,6 @@ class RobotController(Node):
     def barrel_callback(self, msg):
         self.barrels = msg.data
 
-    # --- NEW: Radiation Callback ---
-    def radiation_callback(self, msg):
-        for r in msg.data:
-            if r.robot_id == self.robot_name:
-                self.radiation_level = r.radiation_level
-                break
-
     def scan_callback(self, msg):
         ranges = msg.ranges
         if not ranges: return
@@ -188,6 +188,13 @@ class RobotController(Node):
                 self.holding_barrel = True
                 break
 
+    def radiation_callback(self, msg):
+        """Callback for radiation levels."""
+        for radiation in msg.data:
+            if radiation.robot_id == self.robot_name:
+                self.radiation_level = radiation.level
+                break
+
     def get_best_barrel(self):
         if not self.barrels:
             return None
@@ -212,6 +219,10 @@ class RobotController(Node):
     def elapsed(self):
         if not self.phase_start_time: return 0.0
         return (self.get_clock().now() - self.phase_start_time).nanoseconds / 1e9
+
+    def should_decontaminate(self):
+        """Check if robot needs decontamination."""
+        return self.radiation_level >= self.DECONTAMINATION_THRESHOLD
 
     def control_loop(self):
         
@@ -239,7 +250,7 @@ class RobotController(Node):
                 goal.pose.position.x = wp['x']
                 goal.pose.position.y = wp['y']
                 
-                # # --- SPECIAL LOGIC FOR LEFT CORRIDOR ---
+                # --- SPECIAL LOGIC FOR LEFT CORRIDOR ---
                 if wp['name'] == 'Left Corridor Top':
                     # Face South (Down the corridor)
                     goal.pose.orientation.z = 1.0
@@ -248,7 +259,6 @@ class RobotController(Node):
                     # Face East
                     goal.pose.orientation.z = 0.0
                     goal.pose.orientation.w = 1.0
-                # # ---------------------------------------
 
                 self.navigator.goToPose(goal)
                 self.nav_goal_sent = True
@@ -258,7 +268,6 @@ class RobotController(Node):
                 if self.current_wp_index == 3:
                     self.search_enabled = True
                     self.get_logger().info("⚠️ SEARCH ACTIVATED ⚠️")
-                # ------------------------------------------------
                 
                 self.current_wp_index += 1
                 if self.current_wp_index >= len(self.waypoints):
@@ -306,15 +315,13 @@ class RobotController(Node):
                 else:
                     twist.linear.x = 0.15 
                     
-                    # --- THE WIGGLE FIX IS HERE ---
                     # Only steer if the error is significant (> 10 pixels)
                     if abs(error) > 10:
                         steer = -0.0015 * error
                     else:
-                        steer = 0.0 # Drive straight!
-                    # ------------------------------
+                        steer = 0.0
 
-                    # Wall Avoidance logic remains the same
+                    # Wall Avoidance logic
                     if self.left_dist < 0.35: steer -= 0.3 
                     elif self.right_dist < 0.35: steer += 0.3 
                     
@@ -337,7 +344,7 @@ class RobotController(Node):
                     self.stop_robot()
                     self.collect_phase = CollectPhase.BACKUP
                     self.phase_start_time = self.get_clock().now()
-                    self.get_logger().info(f"Turn Complete. Backing up for 2.0s...")
+                    self.get_logger().info(f"Turn Complete. Backing up for 1.5s...")
 
             elif self.collect_phase == CollectPhase.BACKUP:
                 BACKUP_TIME = 1.5 
@@ -366,11 +373,7 @@ class RobotController(Node):
                         self.get_logger().info("🎉 PICKUP SUCCESS!")
                         self.holding_barrel = True
                         self.set_mask(True) 
-                        
-                        # --- FIX: CLEAR GHOST OBSTACLES ---
                         self.navigator.clearAllCostmaps() 
-                        # ----------------------------------
-
                         self.state = State.DELIVERING 
                         self.nav_goal_sent = False
                     else:
@@ -391,25 +394,20 @@ class RobotController(Node):
             if not self.nav_goal_sent:
                 # --- ZONE CONFIGURATION ---
                 SPACING_X = 0.7 
-                SPACING_Y = 0.7 # Reduced to 0.6 to avoid hitting the top wall
+                SPACING_Y = 0.7
                 ROW_LENGTH = 4  
                 ZONE_CAPACITY = 16
                 
-                # SAFETY TWEAK: Moved x from 12.0 to 11.7 to avoid hitting back wall
                 zones = [
-                    # Zone B (Barrels 1-16)
                     {'name': 'Zone B', 'start_x': 11.7, 'start_y': -8.3},
-                    # Zone A (Barrels 17-32)
                     {'name': 'Zone A', 'start_x': 11.7, 'start_y': -14.6}
                 ]
 
-                # --- DETERMINE TARGET ---
                 total_count = self.barrels_collected
                 zone_index = (total_count // ZONE_CAPACITY) % len(zones)
                 current_zone = zones[zone_index]
                 local_index = total_count % ZONE_CAPACITY
                 
-                # --- GRID CALCULATION ---
                 col = local_index % ROW_LENGTH 
                 row = local_index // ROW_LENGTH 
 
@@ -418,14 +416,11 @@ class RobotController(Node):
 
                 self.get_logger().info(f"🚚 Barrel #{total_count + 1} -> {current_zone['name']} at ({target_x:.2f}, {target_y:.2f})")
                 
-                # Send Goal
                 goal = PoseStamped()
                 goal.header.frame_id = 'map'
                 goal.header.stamp = self.navigator.get_clock().now().to_msg()
                 goal.pose.position.x = target_x
                 goal.pose.position.y = target_y
-                
-                # --- ORIENTATION: FACE WEST (180 Degrees) ---
                 goal.pose.orientation.z = 1.0
                 goal.pose.orientation.w = 0.0
                 
@@ -447,7 +442,7 @@ class RobotController(Node):
         # ========================================================
         elif self.state == State.OFFLOADING:
             
-            # --- 1. REVERSE MANEUVER ---
+            # 1. REVERSE MANEUVER
             t = (self.get_clock().now() - self.offload_start_time).nanoseconds / 1e9
             REVERSE_TIME = 1.8 
             
@@ -459,7 +454,7 @@ class RobotController(Node):
             else:
                 self.stop_robot()
             
-            # --- 2. DROP BARREL ---
+            # 2. DROP BARREL
             if self.service_future is None:
                 req = ItemRequest.Request()
                 req.robot_id = self.robot_name
@@ -474,16 +469,8 @@ class RobotController(Node):
                         self.holding_barrel = False
                         self.barrels_collected += 1
                         
-                        # --- MODIFIED: DECONTAMINATION CHECK ---
-                        self.get_logger().info(f"☢️ Radiation Level: {self.radiation_level:.1f}")
-                        if self.radiation_level > self.DECON_THRESHOLD:
-                            self.get_logger().warn("🚨 RADIATION THRESHOLD EXCEEDED. Decontaminating...")
-                            self.state = State.DECONTAMINATING
-                            self.nav_goal_sent = False
-                        else:
-                            self.state = State.CLEARING_SPACE
-                            self.forward_start_time = self.get_clock().now()
-                        # ---------------------------------------
+                        self.state = State.CLEARING_SPACE
+                        self.forward_start_time = self.get_clock().now()
                     else:
                         self.get_logger().warn("Offload Failed.")
                         self.service_future = None 
@@ -492,74 +479,120 @@ class RobotController(Node):
                 self.service_future = None
 
         # ========================================================
-        # STATE 7: CLEARING SPACE (NEW)
+        # STATE 7: CLEARING SPACE
         # ========================================================
         elif self.state == State.CLEARING_SPACE:
             
-            # --- 1. DRIVE FORWARD FOR 1.0 SECONDS ---
             t = (self.get_clock().now() - self.forward_start_time).nanoseconds / 1e9
             FORWARD_TIME = 1.0 
 
             if t < FORWARD_TIME:
                 twist = Twist()
-                twist.linear.x = 0.15 # Move forward
+                twist.linear.x = 0.15
                 self.cmd_vel_pub.publish(twist)
             else:
                 self.stop_robot()
-                self.get_logger().info("✅ Space cleared. Resuming Patrol.")
+                self.get_logger().info("✅ Space cleared.")
                 
-                # --- 2. CLEAR MAP AND RESUME SEARCHING ---
                 time.sleep(0.5)
                 self.navigator.clearAllCostmaps()
                 
-                # --- KEY FIX: DISABLE SEARCH UNTIL WAYPOINT 3 ---
-                self.state = State.SEARCHING 
-                self.nav_goal_sent = False
-                self.current_wp_index = 3 
-                self.search_enabled = False # <--- DISABLE SEARCH HERE
-                # ------------------------------------------------
+                # Check if we need decontamination
+                if self.should_decontaminate():
+                    self.get_logger().info(f"☢️ RADIATION LEVEL: {self.radiation_level} >= {self.DECONTAMINATION_THRESHOLD}. Going to decontaminate!")
+                    self.state = State.DECONTAMINATING
+                    self.decontaminate_phase = DecontaminatePhase.NAVIGATING
+                    self.nav_goal_sent = False
+                else:
+                    self.get_logger().info(f"Radiation level: {self.radiation_level}. Resuming patrol.")
+                    self.state = State.SEARCHING 
+                    self.nav_goal_sent = False
+                    self.current_wp_index = 3 
+                    self.search_enabled = False
 
         # ========================================================
-        # STATE 8: DECONTAMINATING (NEW)
+        # STATE 8: DECONTAMINATING
         # ========================================================
         elif self.state == State.DECONTAMINATING:
-            if not self.nav_goal_sent:
-                # 1. Move to Decontamination Zone
-                self.get_logger().info("🚑 Moving to Decontamination Zone (9.58, -0.33)...")
-                goal = PoseStamped()
-                goal.header.frame_id = 'map'
-                goal.header.stamp = self.navigator.get_clock().now().to_msg()
-                goal.pose.position.x = 9.58
-                goal.pose.position.y = -0.33
-                goal.pose.orientation.w = 1.0 # Face East
-                self.navigator.goToPose(goal)
-                self.nav_goal_sent = True
-
-            elif self.navigator.isTaskComplete():
-                # 2. Call Service
-                if self.service_future is None:
+            
+            # --- PHASE 1: NAVIGATE TO CYAN ZONE ---
+            if self.decontaminate_phase == DecontaminatePhase.NAVIGATING:
+                if not self.nav_goal_sent:
+                    self.get_logger().info(f"☢️ Navigating to decontamination zone at ({self.decontamination_zone['x']:.2f}, {self.decontamination_zone['y']:.2f})")
+                    
+                    goal = PoseStamped()
+                    goal.header.frame_id = 'map'
+                    goal.header.stamp = self.navigator.get_clock().now().to_msg()
+                    goal.pose.position.x = self.decontamination_zone['x']
+                    goal.pose.position.y = self.decontamination_zone['y']
+                    goal.pose.orientation.z = 0.0
+                    goal.pose.orientation.w = 1.0
+                    
+                    self.navigator.goToPose(goal)
+                    self.nav_goal_sent = True
+                
+                elif self.navigator.isTaskComplete():
+                    if self.navigator.getResult() == TaskResult.SUCCEEDED:
+                        self.get_logger().info("☢️ Arrived at decontamination zone. Reversing into zone...")
+                        self.decontaminate_phase = DecontaminatePhase.REVERSING
+                        self.decontaminate_start_time = self.get_clock().now()
+                    else:
+                        self.get_logger().warn("Failed to reach decontamination zone. Retrying...")
+                        self.nav_goal_sent = False
+            
+            # --- PHASE 2: REVERSE INTO ZONE ---
+            elif self.decontaminate_phase == DecontaminatePhase.REVERSING:
+                t = (self.get_clock().now() - self.decontaminate_start_time).nanoseconds / 1e9
+                REVERSE_TIME = 1.5
+                
+                if t < REVERSE_TIME:
+                    twist = Twist()
+                    twist.linear.x = -0.15
+                    self.cmd_vel_pub.publish(twist)
+                else:
                     self.stop_robot()
+                    self.get_logger().info("☢️ In position. Calling decontaminate service...")
+                    self.decontaminate_phase = DecontaminatePhase.CALLING_SERVICE
+                    self.service_future = None
+            
+            # --- PHASE 3: CALL DECONTAMINATE SERVICE ---
+            elif self.decontaminate_phase == DecontaminatePhase.CALLING_SERVICE:
+                if self.service_future is None:
+                    if not self.decontaminate_client.wait_for_service(timeout_sec=0.5):
+                        self.get_logger().warn("Decontaminate service not available, waiting...")
+                        return
+                    
                     req = ItemRequest.Request()
                     req.robot_id = self.robot_name
-                    self.service_future = self.decon_client.call_async(req)
+                    self.service_future = self.decontaminate_client.call_async(req)
+                    self.get_logger().info(f"☢️ Decontaminate request sent for {self.robot_name}")
                 
                 elif self.service_future.done():
                     try:
                         res = self.service_future.result()
                         if res.success:
-                            self.get_logger().info("✨ DECONTAMINATION COMPLETE! Resuming operations...")
-                            self.radiation_level = 0.0 # Reset local tracker
-                            
-                            # 3. Resume (Go to Clearing Space to move away properly)
-                            self.state = State.CLEARING_SPACE
-                            self.forward_start_time = self.get_clock().now()
-                            self.nav_goal_sent = False
+                            self.get_logger().info(f"✅ DECONTAMINATION SUCCESS! {res.message}")
+                            self.get_logger().info(f"Radiation level now: {self.radiation_level}")
                         else:
-                            self.get_logger().warn(f"Decon Failed: {res.message}")
-                            self.service_future = None # Retry
+                            self.get_logger().warn(f"❌ Decontamination failed: {res.message}")
                     except Exception as e:
-                        self.get_logger().error(f"Decon error: {e}")
+                        self.get_logger().error(f"Decontaminate service error: {e}")
+                    
                     self.service_future = None
+                    
+                    # Drive forward to clear the zone
+                    self.get_logger().info("Driving forward to clear decontamination zone...")
+                    self.forward_start_time = self.get_clock().now()
+                    
+                    # Clear costmaps and return to searching
+                    time.sleep(0.5)
+                    self.navigator.clearAllCostmaps()
+                    
+                    self.state = State.SEARCHING
+                    self.nav_goal_sent = False
+                    self.current_wp_index = 3
+                    self.search_enabled = False
+                    self.get_logger().info("Resuming patrol after decontamination.")
 
     def destroy_node(self):
         self.stop_robot()
