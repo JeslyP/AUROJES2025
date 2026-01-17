@@ -14,7 +14,7 @@ from sensor_msgs.msg import LaserScan
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 # Custom Interfaces
-from assessment_interfaces.msg import BarrelList, BarrelHolders
+from assessment_interfaces.msg import BarrelList, BarrelHolders, RadiationLevels
 from auro_interfaces.srv import ItemRequest
 
 # For Dynamic Parameters (LiDAR Mask)
@@ -506,7 +506,7 @@ class RobotController(Node):
                 self.get_logger().info("✅ Space cleared. Resuming Patrol.")
                 
                 # --- 2. CLEAR MAP AND RESUME SEARCHING ---
-                time.sleep(0.5)
+                
                 self.navigator.clearAllCostmaps()
                 
                 # --- KEY FIX: DISABLE SEARCH UNTIL WAYPOINT 3 ---
