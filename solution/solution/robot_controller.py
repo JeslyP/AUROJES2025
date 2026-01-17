@@ -172,7 +172,21 @@ class RobotController(Node):
                 break
 
     def get_best_barrel(self):
-        if not self.barrels: return None
+        if not self.barrels:
+            return None
+        
+        # LOGIC 1: If we are SEARCHING, look for the closest/biggest one
+        if self.state == State.SEARCHING:
+            return max(self.barrels, key=lambda b: b.size)
+        
+        # LOGIC 2: If we are APPROACHING, Focus on the one in the CENTER!
+        # This prevents switching to a neighbor just because it looks slightly bigger.
+        elif self.state == State.APPROACHING:
+            CAMERA_CENTER = 320
+            # Find the barrel with the smallest X distance to the center
+            return min(self.barrels, key=lambda b: abs(b.x - CAMERA_CENTER))
+        
+        # Default fallback
         return max(self.barrels, key=lambda b: b.size)
 
     def stop_robot(self):
@@ -235,10 +249,12 @@ class RobotController(Node):
                 self.nav_goal_sent = False
 
         # ========================================================
-        # STATE 2: APPROACHING
+        # STATE 2: APPROACHING (Corrected)
         # ========================================================
         elif self.state == State.APPROACHING:
             target = self.get_best_barrel()
+            
+            # 1. Safety Check: If barrel disappears, stop and search again
             if not target:
                 self.get_logger().warn("Lost barrel! Back to patrol.")
                 self.state = State.SEARCHING
@@ -251,8 +267,10 @@ class RobotController(Node):
             twist = Twist()
             error = target.x - CAMERA_CENTER
 
+            # --- PHASE 1: ALIGN (Rotate in place) ---
             if self.collect_phase == CollectPhase.ALIGN:
-                if abs(error) > 15:
+                # Deadband: Only rotate if error is big (> 10)
+                if abs(error) > 10:
                     twist.angular.z = -0.002 * error
                     twist.angular.z = max(-0.5, min(0.5, twist.angular.z))
                     self.cmd_vel_pub.publish(twist)
@@ -260,6 +278,7 @@ class RobotController(Node):
                     self.stop_robot()
                     self.collect_phase = CollectPhase.APPROACH
 
+            # --- PHASE 2: APPROACH (Drive forward) ---
             elif self.collect_phase == CollectPhase.APPROACH:
                 if self.front_dist < STOP_DISTANCE and target.size > MIN_SIZE:
                     self.stop_robot()
@@ -269,9 +288,19 @@ class RobotController(Node):
                     self.phase_start_time = self.get_clock().now()
                 else:
                     twist.linear.x = 0.15 
-                    steer = -0.0015 * error
+                    
+                    # --- THE WIGGLE FIX IS HERE ---
+                    # Only steer if the error is significant (> 10 pixels)
+                    if abs(error) > 10:
+                        steer = -0.0015 * error
+                    else:
+                        steer = 0.0 # Drive straight!
+                    # ------------------------------
+
+                    # Wall Avoidance logic remains the same
                     if self.left_dist < 0.35: steer -= 0.3 
                     elif self.right_dist < 0.35: steer += 0.3 
+                    
                     twist.angular.z = steer
                     self.cmd_vel_pub.publish(twist)
 
