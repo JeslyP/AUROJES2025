@@ -1,6 +1,5 @@
 import sys
 import time
-import math
 import rclpy
 from rclpy.node import Node
 from rclpy.signals import SignalHandlerOptions
@@ -22,9 +21,6 @@ from auro_interfaces.srv import ItemRequest
 from rcl_interfaces.srv import SetParameters
 from rcl_interfaces.msg import Parameter, ParameterValue, ParameterType
 
-# For Global Relocalization
-from std_srvs.srv import Empty
-
 class State(Enum):
     SEARCHING = 0
     APPROACHING = 1
@@ -33,8 +29,7 @@ class State(Enum):
     DELIVERING = 4
     OFFLOADING = 5
     CLEARING_SPACE = 6
-    DECONTAMINATING = 7
-    RECOVERING = 8  # NEW: Recovery state when lost
+    DECONTAMINATING = 7  # Go to cyan zone and decontaminate
 
 class CollectPhase(Enum):
     ALIGN = 0
@@ -46,12 +41,6 @@ class DecontaminatePhase(Enum):
     NAVIGATING = 0
     REVERSING = 1
     CALLING_SERVICE = 2
-
-class RecoveryPhase(Enum):
-    CLEAR_COSTMAPS = 0
-    GLOBAL_LOCALIZE = 1
-    RESET_POSE = 2
-    WAIT_FOR_LOCALIZATION = 3
 
 class RobotController(Node):
 
@@ -88,13 +77,6 @@ class RobotController(Node):
         self.decontaminate_client = self.create_client(ItemRequest, '/decontaminate', callback_group=self.cb_group)
         self.mask_client = self.create_client(SetParameters, f'/{self.robot_name}/dynamic_mask/set_parameters', callback_group=self.cb_group)
         
-        # Global relocalization service
-        self.global_localize_client = self.create_client(
-            Empty, 
-            f'/{self.robot_name}/reinitialize_global_localization',
-            callback_group=self.cb_group
-        )
-        
         if not self.pickup_client.wait_for_service(timeout_sec=2.0):
             self.get_logger().warn("Pickup Service not found!")
 
@@ -102,10 +84,9 @@ class RobotController(Node):
         self.state = State.SEARCHING
         self.collect_phase = CollectPhase.ALIGN
         self.decontaminate_phase = DecontaminatePhase.NAVIGATING
-        self.recovery_phase = RecoveryPhase.CLEAR_COSTMAPS
         self.barrels = []
         self.holding_barrel = False
-        self.radiation_level = 0
+        self.radiation_level = 0  # Track radiation level
         self.search_enabled = False 
         self.phase_start_time = None
         self.service_future = None
@@ -113,16 +94,6 @@ class RobotController(Node):
         self.offload_start_time = None 
         self.forward_start_time = None
         self.decontaminate_start_time = None
-        self.recovery_start_time = None
-
-        # ============================================================
-        # NAVIGATION FAILURE TRACKING (for drift detection)
-        # ============================================================
-        self.nav_failures = 0
-        self.NAV_FAILURE_CLEAR_COSTMAPS = 2    # After 2 failures: clear costmaps
-        self.NAV_FAILURE_GLOBAL_LOCALIZE = 4   # After 4 failures: global relocalization
-        self.NAV_FAILURE_RESET_POSE = 6        # After 6 failures: reset to start
-        self.state_before_recovery = None      # Remember state to return to
 
         # Decontamination threshold
         self.DECONTAMINATION_THRESHOLD = 300
@@ -138,7 +109,7 @@ class RobotController(Node):
             {'x': 0.053, 'y': 7.213, 'name': 'Start Area'},
             {'x': 5.21, 'y': 5.17, 'name': 'Right Corridor Bottom'},
             {'x': 9.351, 'y': 4.7, 'name': 'Right Corridor Top'}, 
-            {'x': 8.000, 'y': 9.041, 'name': 'Left Corridor Top'},
+            {'x': 8.300, 'y': 9.041, 'name': 'Left Corridor Top'},
             {'x': 10.050, 'y': 14.850, 'name': 'Big Room Entrance'},
             {'x': 6.150, 'y': 14.811, 'name': 'Big Room Bottom Right'},
             {'x': 6.426, 'y': 19.251, 'name': 'Big Room Bottom Center'},
@@ -156,7 +127,7 @@ class RobotController(Node):
         
         self.current_wp_index = 1 
         self.nav_goal_sent = False
-        self.timer = self.create_timer(0.2, self.control_loop)
+        self.timer = self.create_timer(0.1, self.control_loop)
         self.get_logger().info("Robot Controller Started")
 
     def set_initial_pose(self):
@@ -228,12 +199,18 @@ class RobotController(Node):
         if not self.barrels:
             return None
         
+        # LOGIC 1: If we are SEARCHING, look for the closest/biggest one
         if self.state == State.SEARCHING:
             return max(self.barrels, key=lambda b: b.size)
+        
+        # LOGIC 2: If we are APPROACHING, Focus on the one in the CENTER!
+        # This prevents switching to a neighbor just because it looks slightly bigger.
         elif self.state == State.APPROACHING:
             CAMERA_CENTER = 320
+            # Find the barrel with the smallest X distance to the center
             return min(self.barrels, key=lambda b: abs(b.x - CAMERA_CENTER))
         
+        # Default fallback
         return max(self.barrels, key=lambda b: b.size)
 
     def stop_robot(self):
@@ -247,120 +224,8 @@ class RobotController(Node):
         """Check if robot needs decontamination."""
         return self.radiation_level >= self.DECONTAMINATION_THRESHOLD
 
-    # ================================================================
-    # NAVIGATION FAILURE HANDLING
-    # ================================================================
-
-    def handle_nav_success(self):
-        """Called when navigation succeeds - reset failure counter."""
-        if self.nav_failures > 0:
-            self.get_logger().info(f"Navigation succeeded! Resetting failure counter (was {self.nav_failures})")
-        self.nav_failures = 0
-
-    def handle_nav_failure(self):
-        """Called when navigation fails - increment counter and possibly recover."""
-        self.nav_failures += 1
-        self.get_logger().warn(f"⚠️ Navigation failure #{self.nav_failures}")
-
-        if self.nav_failures >= self.NAV_FAILURE_RESET_POSE:
-            self.get_logger().error(f"🚨 {self.nav_failures} failures! Resetting to start position...")
-            self.start_recovery(RecoveryPhase.RESET_POSE)
-        elif self.nav_failures >= self.NAV_FAILURE_GLOBAL_LOCALIZE:
-            self.get_logger().warn(f"🔄 {self.nav_failures} failures! Trying global relocalization...")
-            self.start_recovery(RecoveryPhase.GLOBAL_LOCALIZE)
-        elif self.nav_failures >= self.NAV_FAILURE_CLEAR_COSTMAPS:
-            self.get_logger().info(f"🧹 {self.nav_failures} failures! Clearing costmaps...")
-            self.navigator.clearAllCostmaps()
-            # Don't enter recovery state, just clear and retry
-
-    def start_recovery(self, phase):
-        """Enter recovery state."""
-        self.state_before_recovery = self.state
-        self.state = State.RECOVERING
-        self.recovery_phase = phase
-        self.recovery_start_time = self.get_clock().now()
-        self.nav_goal_sent = False
-        self.navigator.cancelTask()
-        self.stop_robot()
-
-    def force_relocalize(self, x, y, yaw=0.0):
-        """Force robot position to a known location."""
-        pose = PoseStamped()
-        pose.header.frame_id = 'map'
-        pose.header.stamp = self.navigator.get_clock().now().to_msg()
-        pose.pose.position.x = x
-        pose.pose.position.y = y
-        pose.pose.orientation.z = math.sin(yaw / 2.0)
-        pose.pose.orientation.w = math.cos(yaw / 2.0)
-        self.navigator.setInitialPose(pose)
-        self.get_logger().info(f"📍 Forced relocalization to ({x:.2f}, {y:.2f})")
-
-    def global_relocalize(self):
-        """Tell AMCL to search the entire map for the robot's position."""
-        if self.global_localize_client.wait_for_service(timeout_sec=1.0):
-            self.global_localize_client.call_async(Empty.Request())
-            self.get_logger().info("🌐 Global relocalization triggered!")
-            return True
-        else:
-            self.get_logger().warn("Global localization service not available")
-            return False
-
     def control_loop(self):
         
-        # ========================================================
-        # STATE 9: RECOVERING (Handle localization issues)
-        # ========================================================
-        if self.state == State.RECOVERING:
-            t = (self.get_clock().now() - self.recovery_start_time).nanoseconds / 1e9
-            
-            if self.recovery_phase == RecoveryPhase.CLEAR_COSTMAPS:
-                self.get_logger().info("🧹 Clearing costmaps...")
-                self.navigator.clearAllCostmaps()
-                time.sleep(1.0)
-                self.recovery_phase = RecoveryPhase.WAIT_FOR_LOCALIZATION
-                self.recovery_start_time = self.get_clock().now()
-                
-            elif self.recovery_phase == RecoveryPhase.GLOBAL_LOCALIZE:
-                self.get_logger().info("🌐 Attempting global relocalization...")
-                self.global_relocalize()
-                self.navigator.clearAllCostmaps()
-                time.sleep(1.0)
-                self.recovery_phase = RecoveryPhase.WAIT_FOR_LOCALIZATION
-                self.recovery_start_time = self.get_clock().now()
-                
-            elif self.recovery_phase == RecoveryPhase.RESET_POSE:
-                self.get_logger().info("📍 Resetting to start position...")
-                # Reset to start area
-                self.force_relocalize(0.053, 7.213, 0.0)
-                self.navigator.clearAllCostmaps()
-                time.sleep(1.0)
-                self.recovery_phase = RecoveryPhase.WAIT_FOR_LOCALIZATION
-                self.recovery_start_time = self.get_clock().now()
-                # Reset waypoint index to start
-                self.current_wp_index = 0
-                
-            elif self.recovery_phase == RecoveryPhase.WAIT_FOR_LOCALIZATION:
-                # Wait 3 seconds for AMCL to settle
-                WAIT_TIME = 3.0
-                if t < WAIT_TIME:
-                    # Spin in place slowly to help AMCL localize
-                    twist = Twist()
-                    twist.angular.z = 0.3
-                    self.cmd_vel_pub.publish(twist)
-                else:
-                    self.stop_robot()
-                    self.get_logger().info("✅ Recovery complete! Resuming operation...")
-                    
-                    # Reset failure counter after recovery
-                    self.nav_failures = 0
-                    
-                    # Return to searching state
-                    self.state = State.SEARCHING
-                    self.nav_goal_sent = False
-                    self.search_enabled = False
-            
-            return  # Don't process other states during recovery
-
         # ========================================================
         # STATE 1: SEARCHING
         # ========================================================
@@ -371,6 +236,7 @@ class RobotController(Node):
                     self.get_logger().info(f"👀 BARREL SPOTTED! Size: {best_barrel.size}")
                     self.navigator.cancelTask()
                     self.stop_robot()
+                    self.navigator.clearAllCostmaps()
                     self.state = State.APPROACHING
                     self.collect_phase = CollectPhase.ALIGN 
                     self.nav_goal_sent = False
@@ -385,10 +251,13 @@ class RobotController(Node):
                 goal.pose.position.x = wp['x']
                 goal.pose.position.y = wp['y']
                 
+                # --- SPECIAL LOGIC FOR LEFT CORRIDOR ---
                 if wp['name'] == 'Left Corridor Top':
+                    # Face South (Down the corridor)
                     goal.pose.orientation.z = 1.0
                     goal.pose.orientation.w = 0.0
                 else:
+                    # Face East
                     goal.pose.orientation.z = 0.0
                     goal.pose.orientation.w = 1.0
 
@@ -396,29 +265,23 @@ class RobotController(Node):
                 self.nav_goal_sent = True
             
             elif self.navigator.isTaskComplete():
-                result = self.navigator.getResult()
+                # --- THIS IS WHERE SEARCH GETS TURNED BACK ON ---
+                if self.current_wp_index == 3:
+                    self.search_enabled = True
+                    self.get_logger().info("⚠️ SEARCH ACTIVATED ⚠️")
                 
-                if result == TaskResult.SUCCEEDED:
-                    self.handle_nav_success()
-                    
-                    if self.current_wp_index == 3:
-                        self.search_enabled = True
-                        self.get_logger().info("⚠️ SEARCH ACTIVATED ⚠️")
-                    
-                    self.current_wp_index += 1
-                    if self.current_wp_index >= len(self.waypoints):
-                        self.current_wp_index = 3 
-                else:
-                    self.handle_nav_failure()
-                
+                self.current_wp_index += 1
+                if self.current_wp_index >= len(self.waypoints):
+                    self.current_wp_index = 3 
                 self.nav_goal_sent = False
 
         # ========================================================
-        # STATE 2: APPROACHING
+        # STATE 2: APPROACHING (Corrected)
         # ========================================================
         elif self.state == State.APPROACHING:
             target = self.get_best_barrel()
             
+            # 1. Safety Check: If barrel disappears, stop and search again
             if not target:
                 self.get_logger().warn("Lost barrel! Back to patrol.")
                 self.state = State.SEARCHING
@@ -431,7 +294,9 @@ class RobotController(Node):
             twist = Twist()
             error = target.x - CAMERA_CENTER
 
+            # --- PHASE 1: ALIGN (Rotate in place) ---
             if self.collect_phase == CollectPhase.ALIGN:
+                # Deadband: Only rotate if error is big (> 10)
                 if abs(error) > 10:
                     twist.angular.z = -0.002 * error
                     twist.angular.z = max(-0.5, min(0.5, twist.angular.z))
@@ -440,21 +305,25 @@ class RobotController(Node):
                     self.stop_robot()
                     self.collect_phase = CollectPhase.APPROACH
 
+            # --- PHASE 2: APPROACH (Drive forward) ---
             elif self.collect_phase == CollectPhase.APPROACH:
                 if self.front_dist < STOP_DISTANCE and target.size > MIN_SIZE:
                     self.stop_robot()
                     self.get_logger().info("✅ Reached Barrel! Starting positioning...")
                     self.state = State.POSITIONING
+                    self.navigator.clearAllCostmaps()
                     self.collect_phase = CollectPhase.TURN_AROUND
                     self.phase_start_time = self.get_clock().now()
                 else:
                     twist.linear.x = 0.15 
                     
+                    # Only steer if the error is significant (> 10 pixels)
                     if abs(error) > 10:
                         steer = -0.0015 * error
                     else:
                         steer = 0.0
 
+                    # Wall Avoidance logic
                     if self.left_dist < 0.35: steer -= 0.3 
                     elif self.right_dist < 0.35: steer += 0.3 
                     
@@ -521,10 +390,11 @@ class RobotController(Node):
                 self.service_future = None
 
         # ========================================================
-        # STATE 5: DELIVERING
+        # STATE 5: DELIVERING (FACING WEST + SAFETY BUFFER)
         # ========================================================
         elif self.state == State.DELIVERING:
             if not self.nav_goal_sent:
+                # --- ZONE CONFIGURATION ---
                 SPACING_X = 0.7 
                 SPACING_Y = 0.7
                 ROW_LENGTH = 4  
@@ -560,24 +430,21 @@ class RobotController(Node):
                 self.nav_goal_sent = True
             
             elif self.navigator.isTaskComplete():
-                result = self.navigator.getResult()
-                
-                if result == TaskResult.SUCCEEDED:
-                    self.handle_nav_success()
+                if self.navigator.getResult() == TaskResult.SUCCEEDED:
                     self.get_logger().info("Arrived. Starting Reverse Park...")
                     self.state = State.OFFLOADING
                     self.offload_start_time = self.get_clock().now() 
                     self.service_future = None
                 else:
-                    self.handle_nav_failure()
                     self.get_logger().warn("Delivery Failed. Retrying...")
                     self.nav_goal_sent = False 
 
         # ========================================================
-        # STATE 6: OFFLOADING
+        # STATE 6: OFFLOADING (WITH REVERSE PARK)
         # ========================================================
         elif self.state == State.OFFLOADING:
             
+            # 1. REVERSE MANEUVER
             t = (self.get_clock().now() - self.offload_start_time).nanoseconds / 1e9
             REVERSE_TIME = 1.8 
             
@@ -589,6 +456,7 @@ class RobotController(Node):
             else:
                 self.stop_robot()
             
+            # 2. DROP BARREL
             if self.service_future is None:
                 req = ItemRequest.Request()
                 req.robot_id = self.robot_name
@@ -631,6 +499,7 @@ class RobotController(Node):
                 time.sleep(0.5)
                 self.navigator.clearAllCostmaps()
                 
+                # Check if we need decontamination
                 if self.should_decontaminate():
                     self.get_logger().info(f"☢️ RADIATION LEVEL: {self.radiation_level} >= {self.DECONTAMINATION_THRESHOLD}. Going to decontaminate!")
                     self.state = State.DECONTAMINATING
@@ -648,6 +517,7 @@ class RobotController(Node):
         # ========================================================
         elif self.state == State.DECONTAMINATING:
             
+            # --- PHASE 1: NAVIGATE TO CYAN ZONE ---
             if self.decontaminate_phase == DecontaminatePhase.NAVIGATING:
                 if not self.nav_goal_sent:
                     self.get_logger().info(f"☢️ Navigating to decontamination zone at ({self.decontamination_zone['x']:.2f}, {self.decontamination_zone['y']:.2f})")
@@ -664,18 +534,15 @@ class RobotController(Node):
                     self.nav_goal_sent = True
                 
                 elif self.navigator.isTaskComplete():
-                    result = self.navigator.getResult()
-                    
-                    if result == TaskResult.SUCCEEDED:
-                        self.handle_nav_success()
+                    if self.navigator.getResult() == TaskResult.SUCCEEDED:
                         self.get_logger().info("☢️ Arrived at decontamination zone. Reversing into zone...")
                         self.decontaminate_phase = DecontaminatePhase.REVERSING
                         self.decontaminate_start_time = self.get_clock().now()
                     else:
-                        self.handle_nav_failure()
                         self.get_logger().warn("Failed to reach decontamination zone. Retrying...")
                         self.nav_goal_sent = False
             
+            # --- PHASE 2: REVERSE INTO ZONE ---
             elif self.decontaminate_phase == DecontaminatePhase.REVERSING:
                 t = (self.get_clock().now() - self.decontaminate_start_time).nanoseconds / 1e9
                 REVERSE_TIME = 1.5
@@ -690,6 +557,7 @@ class RobotController(Node):
                     self.decontaminate_phase = DecontaminatePhase.CALLING_SERVICE
                     self.service_future = None
             
+            # --- PHASE 3: CALL DECONTAMINATE SERVICE ---
             elif self.decontaminate_phase == DecontaminatePhase.CALLING_SERVICE:
                 if self.service_future is None:
                     if not self.decontaminate_client.wait_for_service(timeout_sec=0.5):
@@ -714,9 +582,11 @@ class RobotController(Node):
                     
                     self.service_future = None
                     
+                    # Drive forward to clear the zone
                     self.get_logger().info("Driving forward to clear decontamination zone...")
                     self.forward_start_time = self.get_clock().now()
                     
+                    # Clear costmaps and return to searching
                     time.sleep(0.5)
                     self.navigator.clearAllCostmaps()
                     
