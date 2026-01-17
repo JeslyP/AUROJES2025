@@ -23,5 +23,76 @@
   },
   "containerEnv": {
     "VNC_RESOLUTION": "1280x720x24"
+  },
+  "customizations": {
+    "auro": {
+      "scenarios": [
+        {
+          "name": "Scenario 1 - Baseline Single Robot",
+          "description": "Single robot with obstacles, no sensor noise. Tests basic navigation, search, collection and decontamination in standard conditions.",
+          "parameters": {
+            "use_nav2": "true",
+            "use_rviz": "true",
+            "num_robots": 1,
+            "sensor_noise": "false",
+            "obstacles": "true",
+            "random_seed": 0,
+            "experiment_duration": "840.0"
+          }
+        },
+        {
+          "name": "Scenario 2 - Sensor Noise Robustness",
+          "description": "Single robot with sensor noise enabled. Tests robustness of vision, LiDAR and odometry under realistic noisy conditions.",
+          "parameters": {
+            "use_nav2": "true",
+            "use_rviz": "true",
+            "num_robots": 1,
+            "sensor_noise": "true",
+            "obstacles": "true",
+            "random_seed": 0,
+            "experiment_duration": "840.0"
+          }
+        },
+        {
+          "name": "Scenario 3 - Different Barrel Distribution",
+          "description": "Single robot with different random seed for barrel placement. Tests adaptability of search strategy to varying item locations.",
+          "parameters": {
+            "use_nav2": "true",
+            "use_rviz": "true",
+            "num_robots": 1,
+            "sensor_noise": "false",
+            "obstacles": "true",
+            "random_seed": 42,
+            "experiment_duration": "840.0"
+          }
+        },
+        {
+          "name": "Scenario 4 - Open Environment (No Obstacles)",
+          "description": "Single robot without obstacles in the large room. Tests search efficiency and navigation in open space.",
+          "parameters": {
+            "use_nav2": "true",
+            "use_rviz": "true",
+            "num_robots": 1,
+            "sensor_noise": "false",
+            "obstacles": "false",
+            "random_seed": 0,
+            "experiment_duration": "840.0"
+          }
+        },
+        {
+          "name": "Scenario 5 - Full Complexity with Noise",
+          "description": "Single robot with sensor noise and obstacles. Stress test combining all challenging conditions to evaluate overall system robustness.",
+          "parameters": {
+            "use_nav2": "true",
+            "use_rviz": "true",
+            "num_robots": 1,
+            "sensor_noise": "true",
+            "obstacles": "true",
+            "random_seed": 123,
+            "experiment_duration": "840.0"
+          }
+        }
+      ]
+    }
   }
 }
