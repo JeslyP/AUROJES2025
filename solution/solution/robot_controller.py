@@ -96,7 +96,7 @@ class RobotController(Node):
         self.decontaminate_start_time = None
 
         # Decontamination threshold
-        self.DECONTAMINATION_THRESHOLD = 300
+        self.DECONTAMINATION_THRESHOLD = 50
 
         # LiDAR Data
         self.front_dist = float('inf')
