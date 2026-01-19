@@ -14,7 +14,7 @@ from sensor_msgs.msg import LaserScan
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 # Custom Interfaces
-from assessment_interfaces.msg import BarrelList, BarrelHolders, RadiationList
+from assessment_interfaces.msg import BarrelList, BarrelHolders, RadiationList, ZoneList
 from auro_interfaces.srv import ItemRequest
 
 # For Dynamic Parameters (LiDAR Mask)
@@ -66,6 +66,7 @@ class RobotController(Node):
         self.create_subscription(LaserScan, 'scan_filtered', self.scan_callback, 10)
         self.create_subscription(BarrelHolders, '/barrel_holders', self.holders_callback, 10)
         self.create_subscription(RadiationList, '/radiation_levels', self.radiation_callback, 10)
+        self.create_subscription(ZoneList, 'zones', self.zones_callback, 10)  # NEW: Zone detection
 
         # 4. PUBLISHERS
         self.cmd_vel_pub = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -85,6 +86,7 @@ class RobotController(Node):
         self.collect_phase = CollectPhase.ALIGN
         self.decontaminate_phase = DecontaminatePhase.NAVIGATING
         self.barrels = []
+        self.zones = []  # NEW: Store detected zones
         self.holding_barrel = False
         self.radiation_level = 0  # Track radiation level
         self.search_enabled = False 
@@ -94,6 +96,10 @@ class RobotController(Node):
         self.offload_start_time = None 
         self.forward_start_time = None
         self.decontaminate_start_time = None
+
+        # Zone type constants (NEW)
+        self.ZONE_CYAN = 0    # Decontamination zone
+        self.ZONE_GREEN = 1   # Collection zone
 
         # Decontamination threshold
         self.DECONTAMINATION_THRESHOLD = 50
@@ -107,9 +113,9 @@ class RobotController(Node):
         # 7. PATROL ROUTE
         self.waypoints = [
             {'x': 0.053, 'y': 7.213, 'name': 'Start Area'},
-            {'x': 5.21, 'y': 5.17, 'name': 'Right Corridor Bottom'},
-            {'x': 9.351, 'y': 4.7, 'name': 'Right Corridor Top'}, 
-            {'x': 8.300, 'y': 9.41, 'name': 'Left Corridor Top'},
+            {'x': 5.27, 'y': 5.14, 'name': 'Right Corridor Bottom'},
+            {'x': 9.351, 'y': 4.9, 'name': 'Right Corridor Top'}, 
+            {'x': 8.300, 'y': 9.50, 'name': 'Left Corridor Top'},
             {'x': 10.050, 'y': 14.850, 'name': 'Big Room Entrance'},
             {'x': 6.150, 'y': 14.811, 'name': 'Big Room Bottom Right'},
             {'x': 6.426, 'y': 19.251, 'name': 'Big Room Bottom Center'},
@@ -123,7 +129,7 @@ class RobotController(Node):
         ]
 
         # Decontamination zone (cyan zone)
-        self.decontamination_zone = {'x': 9.58, 'y': -0.33}
+        self.decontamination_zone = {'x': 10.2, 'y': -0.33}
         
         self.current_wp_index = 1 
         self.nav_goal_sent = False
@@ -158,6 +164,10 @@ class RobotController(Node):
 
     def barrel_callback(self, msg):
         self.barrels = msg.data
+
+    def zones_callback(self, msg):
+        """NEW: Callback for zone detection."""
+        self.zones = msg.data
 
     def scan_callback(self, msg):
         ranges = msg.ranges
@@ -212,6 +222,17 @@ class RobotController(Node):
         
         # Default fallback
         return max(self.barrels, key=lambda b: b.size)
+
+    def get_zone(self, zone_type):
+        """
+        NEW: Find a zone by type.
+        zone_type: 0 = CYAN (decontamination), 1 = GREEN (collection)
+        Returns the largest (closest) zone of that type, or None
+        """
+        matching = [z for z in self.zones if z.zone == zone_type]
+        if matching:
+            return max(matching, key=lambda z: z.size)
+        return None
 
     def stop_robot(self):
         self.cmd_vel_pub.publish(Twist())
@@ -456,7 +477,12 @@ class RobotController(Node):
             else:
                 self.stop_robot()
             
-            # 2. DROP BARREL
+            # 2. CHECK FOR GREEN ZONE (NEW - Visual confirmation)
+            green_zone = self.get_zone(self.ZONE_GREEN)
+            if green_zone:
+                self.get_logger().info(f"🟢 GREEN zone confirmed! Size: {green_zone.size}")
+            
+            # 3. DROP BARREL
             if self.service_future is None:
                 req = ItemRequest.Request()
                 req.robot_id = self.robot_name
@@ -559,6 +585,11 @@ class RobotController(Node):
             
             # --- PHASE 3: CALL DECONTAMINATE SERVICE ---
             elif self.decontaminate_phase == DecontaminatePhase.CALLING_SERVICE:
+                # Check for cyan zone visually (NEW)
+                cyan_zone = self.get_zone(self.ZONE_CYAN)
+                if cyan_zone:
+                    self.get_logger().info(f"🟦 CYAN zone confirmed! Size: {cyan_zone.size}")
+                
                 if self.service_future is None:
                     if not self.decontaminate_client.wait_for_service(timeout_sec=0.5):
                         self.get_logger().warn("Decontaminate service not available, waiting...")
