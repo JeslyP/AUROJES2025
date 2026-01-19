@@ -110,38 +110,39 @@ class RobotController(Node):
         self.right_dist = float('inf')
         self.back_dist = float('inf') 
         
-        # 7. PATROL ROUTE
+        # 7. PATROL ROUTE (Translated for New Map Origin)
         self.waypoints = [
-            {'x': 0.053, 'y': 7.213, 'name': 'Start Area'},
-            {'x': 5.27, 'y': 5.14, 'name': 'Right Corridor Bottom'},
-            {'x': 9.351, 'y': 4.9, 'name': 'Right Corridor Top'}, 
-            {'x': 8.300, 'y': 8.20, 'name': 'Left Corridor Top'},
-            {'x': 10.050, 'y': 14.850, 'name': 'Big Room Entrance'},
-            {'x': 6.150, 'y': 14.811, 'name': 'Big Room Bottom Right'},
-            {'x': 6.426, 'y': 19.251, 'name': 'Big Room Bottom Center'},
-            {'x': 6.366, 'y': 23.279, 'name': 'Big Room Bottom Left'},
-            {'x': 10.152, 'y': 23.138, 'name': 'Big Room Middle Left'},
-            {'x': 14.433, 'y': 23.024, 'name': 'Big Room Top Left'},
-            {'x': 14.264, 'y': 18.680, 'name': 'Big Room Top Middle'},
-            {'x': 14.286, 'y': 14.876, 'name': 'Big Room Top Right'},
-            {'x': 10.134, 'y': 19.612, 'name': 'Big Room Center'},
-            {'x': 10.050, 'y': 14.850, 'name': 'Big Room Entrance (Exit)'},
+            {'x': 0.073, 'y': 0.013, 'name': 'Start Area'},
+            {'x': 5.29,  'y': -2.06, 'name': 'Right Corridor Bottom'},
+            {'x': 9.371, 'y': -2.3,  'name': 'Right Corridor Top'}, 
+            {'x': 8.32,  'y': 1.9,   'name': 'Left Corridor Top'},
+            {'x': 10.07, 'y': 7.65,  'name': 'Big Room Entrance'},
+            {'x': 6.17,  'y': 7.611, 'name': 'Big Room Bottom Right'},
+            {'x': 6.446, 'y': 12.051,'name': 'Big Room Bottom Center'},
+            {'x': 6.386, 'y': 16.079,'name': 'Big Room Bottom Left'},
+            {'x': 10.172,'y': 15.938,'name': 'Big Room Middle Left'},
+            {'x': 14.453,'y': 15.824,'name': 'Big Room Top Left'},
+            {'x': 14.284,'y': 11.48, 'name': 'Big Room Top Middle'},
+            {'x': 14.306,'y': 7.676, 'name': 'Big Room Top Right'},
+            {'x': 10.154,'y': 12.412,'name': 'Big Room Center'},
+            {'x': 10.07, 'y': 7.65,  'name': 'Big Room Entrance (Exit)'},
         ]
 
-        # Decontamination zone (cyan zone)
-        self.decontamination_zone = {'x': 10.2, 'y': -0.33}
+        # Decontamination zone (cyan zone) - Translated
+        self.decontamination_zone = {'x': 10.22, 'y': -7.53}
         
         self.current_wp_index = 1 
         self.nav_goal_sent = False
         self.timer = self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("Robot Controller Started")
+        self.get_logger().info("Robot Controller Started with Updated Coordinates")
 
     def set_initial_pose(self):
+        # The Gazebo spawn (0.0, -2.0) now corresponds to map position (0.073, 0.013)
         pose = PoseStamped()
         pose.header.frame_id = 'map'
         pose.header.stamp = self.navigator.get_clock().now().to_msg()
-        pose.pose.position.x = 0.053
-        pose.pose.position.y = 7.213
+        pose.pose.position.x = 0.073
+        pose.pose.position.y = 0.013
         pose.pose.orientation.z = 0.0
         pose.pose.orientation.w = 1.0
         self.navigator.setInitialPose(pose)
@@ -422,8 +423,8 @@ class RobotController(Node):
                 ZONE_CAPACITY = 16
                 
                 zones = [
-                    {'name': 'Zone B', 'start_x': 11.7, 'start_y': -8.3},
-                    {'name': 'Zone A', 'start_x': 11.7, 'start_y': -14.6}
+                    {'name': 'Zone B', 'start_x': 11.72, 'start_y': -15.5},
+                    {'name': 'Zone A', 'start_x': 11.72, 'start_y': -21.8}
                 ]
 
                 total_count = self.barrels_collected
