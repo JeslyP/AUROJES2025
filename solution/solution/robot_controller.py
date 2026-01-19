@@ -115,7 +115,7 @@ class RobotController(Node):
             {'x': 0.053, 'y': 7.213, 'name': 'Start Area'},
             {'x': 5.27, 'y': 5.14, 'name': 'Right Corridor Bottom'},
             {'x': 9.351, 'y': 4.9, 'name': 'Right Corridor Top'}, 
-            {'x': 8.300, 'y': 9.50, 'name': 'Left Corridor Top'},
+            {'x': 8.300, 'y': 8.20, 'name': 'Left Corridor Top'},
             {'x': 10.050, 'y': 14.850, 'name': 'Big Room Entrance'},
             {'x': 6.150, 'y': 14.811, 'name': 'Big Room Bottom Right'},
             {'x': 6.426, 'y': 19.251, 'name': 'Big Room Bottom Center'},
