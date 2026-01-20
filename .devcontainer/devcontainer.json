@@ -62,7 +62,7 @@
             "num_robots": 1,
             "sensor_noise": "false",
             "obstacles": "true",
-            "random_seed": 102,
+            "random_seed": 115,
             "experiment_duration": "840.0"
           }
         },
