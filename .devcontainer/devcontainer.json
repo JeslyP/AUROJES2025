@@ -37,7 +37,7 @@
             "sensor_noise": "false",
             "obstacles": "true",
             "random_seed": 0,
-            "experiment_duration": "840.0"
+            "experiment_duration": "10800.0"
           }
         },
         {
@@ -50,7 +50,7 @@
             "sensor_noise": "true",
             "obstacles": "true",
             "random_seed": 0,
-            "experiment_duration": "840.0"
+            "experiment_duration": "10800.0"
           }
         },
         {
@@ -63,7 +63,7 @@
             "sensor_noise": "false",
             "obstacles": "true",
             "random_seed": 115,
-            "experiment_duration": "840.0"
+            "experiment_duration": "10800.0"
           }
         },
         {
@@ -76,7 +76,7 @@
             "sensor_noise": "false",
             "obstacles": "false",
             "random_seed": 0,
-            "experiment_duration": "840.0"
+            "experiment_duration": "10800.0"
           }
         },
         {
@@ -89,7 +89,7 @@
             "sensor_noise": "true",
             "obstacles": "true",
             "random_seed": 123,
-            "experiment_duration": "840.0"
+            "experiment_duration": "10800.0"
           }
         }
       ]
