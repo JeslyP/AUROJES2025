@@ -201,6 +201,9 @@ class RobotController(Node):
         
         # Performance metrics
         self.barrels_collected = 0
+        
+        # Target tracking for hysteresis (prevents oscillation between barrels)
+        self.current_target_size = 0
 
         # ============================================================
         # 7. CONSTANTS
@@ -211,6 +214,9 @@ class RobotController(Node):
 
         # Decontamination threshold (trigger when radiation >= 50)
         self.DECONTAMINATION_THRESHOLD = 50
+        
+        # Barrel switching threshold (switch to new barrel if 30% larger)
+        self.BARREL_SWITCH_THRESHOLD = 1.3
 
         # LiDAR distance measurements (initialised to infinity)
         self.front_dist = float('inf')
@@ -400,29 +406,57 @@ class RobotController(Node):
 
     def get_best_barrel(self):
         """
-        Select the best barrel to target based on current state.
+        Select the best barrel to target with hysteresis to prevent oscillation.
         
-        In SEARCHING state: Select largest barrel (closest)
-        In APPROACHING state: Select barrel closest to camera center
-                             (prevents target switching during approach)
+        Uses a combination of size (larger = closer) and position (centered)
+        to select targets. Implements hysteresis to prevent rapid switching
+        between similar barrels while still allowing switching to significantly
+        closer barrels that appear in the robot's path.
+        
+        Behaviour:
+        - SEARCHING: Always select largest barrel (closest)
+        - APPROACHING: Switch to new barrel only if 30% larger than current
+                      Otherwise track the most centered barrel
         
         Returns:
             Barrel object or None if no barrels detected
         """
         if not self.barrels:
+            self.current_target_size = 0
             return None
         
+        CAMERA_CENTER = 320
+        
+        # Find the largest barrel (typically closest)
+        largest = max(self.barrels, key=lambda b: b.size)
+        
+        # Find the most centered barrel (for stable tracking)
+        centered = min(self.barrels, key=lambda b: abs(b.x - CAMERA_CENTER))
+        
         if self.state == State.SEARCHING:
-            # Largest barrel is typically closest
-            return max(self.barrels, key=lambda b: b.size)
+            # In SEARCHING state, always pick the largest (closest) barrel
+            self.current_target_size = largest.size
+            return largest
         
         elif self.state == State.APPROACHING:
-            # Keep tracking the centered barrel to avoid switching targets
-            CAMERA_CENTER = 320
-            return min(self.barrels, key=lambda b: abs(b.x - CAMERA_CENTER))
+            # Check if a significantly larger barrel has appeared
+            # This handles the case where we're driving toward a far barrel
+            # and a closer one comes into view
+            if largest.size > self.current_target_size * self.BARREL_SWITCH_THRESHOLD:
+                self.current_target_size = largest.size
+                self.collect_phase = CollectPhase.ALIGN  # Re-align to new target
+                self.get_logger().info(
+                    f"Switching to closer barrel! Size: {largest.size:.0f} "
+                    f"(was {self.current_target_size / self.BARREL_SWITCH_THRESHOLD:.0f})")
+                return largest
+            
+            # Otherwise keep tracking the most centered barrel for stability
+            # Update target size to current centered barrel's size
+            self.current_target_size = centered.size
+            return centered
         
-        # Default: largest barrel
-        return max(self.barrels, key=lambda b: b.size)
+        # Default fallback: return largest barrel
+        return largest
 
     def get_zone(self, zone_type):
         """
@@ -484,7 +518,7 @@ class RobotController(Node):
             if self.search_enabled:
                 best_barrel = self.get_best_barrel()
                 if best_barrel and not self.holding_barrel:
-                    self.get_logger().info(f"BARREL SPOTTED! Size: {best_barrel.size}")
+                    self.get_logger().info(f"BARREL SPOTTED! Size: {best_barrel.size:.0f}")
                     self.navigator.cancelTask()
                     self.stop_robot()
                     self.navigator.clearAllCostmaps()
@@ -540,6 +574,7 @@ class RobotController(Node):
             if not target:
                 self.get_logger().warn("Lost barrel! Back to patrol.")
                 self.state = State.SEARCHING
+                self.current_target_size = 0  # Reset target tracking
                 return
 
             # Visual servoing parameters
@@ -572,6 +607,7 @@ class RobotController(Node):
                     self.navigator.clearAllCostmaps()
                     self.collect_phase = CollectPhase.TURN_AROUND
                     self.phase_start_time = self.get_clock().now()
+                    self.current_target_size = 0  # Reset target tracking
                 else:
                     # Drive forward with steering correction
                     twist.linear.x = 0.15
