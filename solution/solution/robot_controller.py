@@ -216,16 +216,16 @@ class RobotController(Node):
         # Decontamination threshold (trigger when radiation >= 50)
         self.DECONTAMINATION_THRESHOLD = 50
         
-        # Barrel switching threshold (switch to new barrel if 30% larger)
-        self.BARREL_SWITCH_THRESHOLD = 1.4
+        # Barrel switching threshold (switch to new barrel if 50% larger)
+        self.BARREL_SWITCH_THRESHOLD = 1.5
         
         # Minimum barrel size to target (filters out distant barrels)
         # Prevents targeting barrels in big room while still in hallway
-        # Adjust this value based on testing (higher = must be closer)
-        self.MIN_TARGET_SIZE = 300
+        # Size ~1800 = too far (hallway view), Size ~5000+ = close enough
+        self.MIN_TARGET_SIZE = 5000
         
-        # NEW: Maximum time to spend approaching a barrel before giving up (seconds)
-        self.MAX_APPROACH_TIME = 120.0
+        # Maximum time to spend approaching a barrel before giving up (seconds)
+        self.MAX_APPROACH_TIME = 30.0
 
         # LiDAR distance measurements (initialised to infinity)
         self.front_dist = float('inf')
@@ -534,7 +534,13 @@ class RobotController(Node):
             time.sleep(0.1)
         
         self.stop_robot()
+        
+        # Clear costmaps after escape
+        time.sleep(0.3)
         self.navigator.clearAllCostmaps()
+        time.sleep(0.3)
+        self.navigator.clearAllCostmaps()
+        self.get_logger().info("Costmaps cleared after escape.")
 
     # ================================================================
     # MAIN CONTROL LOOP
@@ -592,8 +598,8 @@ class RobotController(Node):
             
             # Check if waypoint reached
             elif self.navigator.isTaskComplete():
-                # Enable search after reaching waypoint 3 (entering main room)
-                if self.current_wp_index == 3:
+                # Enable search after reaching waypoint 3 or any waypoint after timeout
+                if self.current_wp_index >= 3:
                     self.search_enabled = True
                     self.get_logger().info("SEARCH ACTIVATED")
                 
@@ -627,11 +633,16 @@ class RobotController(Node):
                     self.current_target_size = 0
                     self.approach_start_time = None
                     
+                    # IMPORTANT: Disable search temporarily to force navigation
+                    # This prevents immediately re-targeting the same problematic barrels
+                    self.search_enabled = False
+                    
                     # Move to next waypoint to find different barrels
                     self.current_wp_index += 1
                     if self.current_wp_index >= len(self.waypoints):
                         self.current_wp_index = 3
                     
+                    self.get_logger().info(f"Moving to waypoint {self.current_wp_index} before re-enabling search.")
                     return
             
             target = self.get_best_barrel()
