@@ -216,12 +216,12 @@ class RobotController(Node):
         self.DECONTAMINATION_THRESHOLD = 50
         
         # Barrel switching threshold (switch to new barrel if 30% larger)
-        self.BARREL_SWITCH_THRESHOLD = 1.3
+        self.BARREL_SWITCH_THRESHOLD = 1.4
         
         # Minimum barrel size to target (filters out distant barrels)
         # Prevents targeting barrels in big room while still in hallway
         # Adjust this value based on testing (higher = must be closer)
-        self.MIN_TARGET_SIZE = 2500
+        self.MIN_TARGET_SIZE = 300
 
         # LiDAR distance measurements (initialised to infinity)
         self.front_dist = float('inf')
