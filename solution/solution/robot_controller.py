@@ -217,6 +217,11 @@ class RobotController(Node):
         
         # Barrel switching threshold (switch to new barrel if 30% larger)
         self.BARREL_SWITCH_THRESHOLD = 1.3
+        
+        # Minimum barrel size to target (filters out distant barrels)
+        # Prevents targeting barrels in big room while still in hallway
+        # Adjust this value based on testing (higher = must be closer)
+        self.MIN_TARGET_SIZE = 2500
 
         # LiDAR distance measurements (initialised to infinity)
         self.front_dist = float('inf')
@@ -406,35 +411,46 @@ class RobotController(Node):
 
     def get_best_barrel(self):
         """
-        Select the best barrel to target with hysteresis to prevent oscillation.
+        Select the best barrel to target with hysteresis and distance filtering.
         
         Uses a combination of size (larger = closer) and position (centered)
-        to select targets. Implements hysteresis to prevent rapid switching
-        between similar barrels while still allowing switching to significantly
-        closer barrels that appear in the robot's path.
+        to select targets. Implements:
+        1. Distance filtering: Ignores barrels below MIN_TARGET_SIZE (too far)
+        2. Hysteresis: Prevents rapid switching between similar barrels
+        3. Proximity override: Allows switching to significantly closer barrels
         
         Behaviour:
-        - SEARCHING: Always select largest barrel (closest)
+        - First filters out distant barrels (size < MIN_TARGET_SIZE)
+        - SEARCHING: Always select largest nearby barrel (closest)
         - APPROACHING: Switch to new barrel only if 30% larger than current
                       Otherwise track the most centered barrel
         
         Returns:
-            Barrel object or None if no barrels detected
+            Barrel object or None if no nearby barrels detected
         """
         if not self.barrels:
             self.current_target_size = 0
             return None
         
+        # DISTANCE FILTER: Only consider barrels that are close enough
+        # This prevents targeting barrels in the big room while in the hallway
+        nearby_barrels = [b for b in self.barrels if b.size >= self.MIN_TARGET_SIZE]
+        
+        if not nearby_barrels:
+            # No barrels close enough to target
+            self.current_target_size = 0
+            return None
+        
         CAMERA_CENTER = 320
         
-        # Find the largest barrel (typically closest)
-        largest = max(self.barrels, key=lambda b: b.size)
+        # Find the largest nearby barrel (typically closest)
+        largest = max(nearby_barrels, key=lambda b: b.size)
         
-        # Find the most centered barrel (for stable tracking)
-        centered = min(self.barrels, key=lambda b: abs(b.x - CAMERA_CENTER))
+        # Find the most centered nearby barrel (for stable tracking)
+        centered = min(nearby_barrels, key=lambda b: abs(b.x - CAMERA_CENTER))
         
         if self.state == State.SEARCHING:
-            # In SEARCHING state, always pick the largest (closest) barrel
+            # In SEARCHING state, always pick the largest (closest) nearby barrel
             self.current_target_size = largest.size
             return largest
         
@@ -455,7 +471,7 @@ class RobotController(Node):
             self.current_target_size = centered.size
             return centered
         
-        # Default fallback: return largest barrel
+        # Default fallback: return largest nearby barrel
         return largest
 
     def get_zone(self, zone_type):
