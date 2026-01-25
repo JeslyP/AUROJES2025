@@ -195,6 +195,7 @@ class RobotController(Node):
         self.offload_start_time = None
         self.forward_start_time = None
         self.decontaminate_start_time = None
+        self.approach_start_time = None  # NEW: Timer for approach timeout
         
         # Service call tracking
         self.service_future = None
@@ -222,6 +223,9 @@ class RobotController(Node):
         # Prevents targeting barrels in big room while still in hallway
         # Adjust this value based on testing (higher = must be closer)
         self.MIN_TARGET_SIZE = 300
+        
+        # NEW: Maximum time to spend approaching a barrel before giving up (seconds)
+        self.MAX_APPROACH_TIME = 120.0
 
         # LiDAR distance measurements (initialised to infinity)
         self.front_dist = float('inf')
@@ -513,6 +517,25 @@ class RobotController(Node):
         """
         return self.radiation_level >= self.DECONTAMINATION_THRESHOLD
 
+    def escape_backward(self):
+        """
+        Emergency escape manoeuvre - reverse to get unstuck.
+        
+        Used when the robot is stuck or approach times out.
+        Reverses for 2 seconds then clears costmaps.
+        """
+        self.get_logger().info("Executing escape manoeuvre (reversing)...")
+        twist = Twist()
+        twist.linear.x = -0.2  # Reverse at 0.2 m/s
+        
+        # Reverse for 2 seconds (20 iterations at 10Hz)
+        for _ in range(20):
+            self.cmd_vel_pub.publish(twist)
+            time.sleep(0.1)
+        
+        self.stop_robot()
+        self.navigator.clearAllCostmaps()
+
     # ================================================================
     # MAIN CONTROL LOOP
     # ================================================================
@@ -539,7 +562,8 @@ class RobotController(Node):
                     self.stop_robot()
                     self.navigator.clearAllCostmaps()
                     self.state = State.APPROACHING
-                    self.collect_phase = CollectPhase.ALIGN 
+                    self.collect_phase = CollectPhase.ALIGN
+                    self.approach_start_time = self.get_clock().now()  # NEW: Start approach timer
                     self.nav_goal_sent = False
                     return
 
@@ -584,13 +608,40 @@ class RobotController(Node):
         # Visual servoing to approach detected barrel
         # ============================================================
         elif self.state == State.APPROACHING:
+            # --- NEW: TIMEOUT CHECK ---
+            # If approaching for too long, give up and move to next waypoint
+            if self.approach_start_time is not None:
+                approach_elapsed = (self.get_clock().now() - self.approach_start_time).nanoseconds / 1e9
+                if approach_elapsed > self.MAX_APPROACH_TIME:
+                    self.get_logger().warn(
+                        f"APPROACH TIMEOUT after {approach_elapsed:.1f}s! "
+                        f"Giving up on this barrel.")
+                    self.stop_robot()
+                    
+                    # Execute escape manoeuvre to get unstuck
+                    self.escape_backward()
+                    
+                    # Reset and return to searching
+                    self.state = State.SEARCHING
+                    self.nav_goal_sent = False
+                    self.current_target_size = 0
+                    self.approach_start_time = None
+                    
+                    # Move to next waypoint to find different barrels
+                    self.current_wp_index += 1
+                    if self.current_wp_index >= len(self.waypoints):
+                        self.current_wp_index = 3
+                    
+                    return
+            
             target = self.get_best_barrel()
             
             # Safety: Return to searching if barrel lost
             if not target:
                 self.get_logger().warn("Lost barrel! Back to patrol.")
                 self.state = State.SEARCHING
-                self.current_target_size = 0  # Reset target tracking
+                self.current_target_size = 0
+                self.approach_start_time = None  # NEW: Reset timer
                 return
 
             # Visual servoing parameters
@@ -623,7 +674,8 @@ class RobotController(Node):
                     self.navigator.clearAllCostmaps()
                     self.collect_phase = CollectPhase.TURN_AROUND
                     self.phase_start_time = self.get_clock().now()
-                    self.current_target_size = 0  # Reset target tracking
+                    self.current_target_size = 0
+                    self.approach_start_time = None  # NEW: Reset timer on success
                 else:
                     # Drive forward with steering correction
                     twist.linear.x = 0.15
