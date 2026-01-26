@@ -2,7 +2,7 @@
 """
 AURO 2025 Coursework - Autonomous Hazardous Material Collection System
 
-This module implements an autonomous barrel collection robot using a Finite State Machine (FSM)
+This is implementation of an autonomous barrel collection robot using a Finite State Machine (FSM)
 architecture. The robot patrols a predefined route, detects and collects contaminated (red) and
 clean (blue) barrels, delivers them to designated green zones, and autonomously decontaminates
 when radiation levels exceed a threshold.
@@ -195,7 +195,7 @@ class RobotController(Node):
         self.offload_start_time = None
         self.forward_start_time = None
         self.decontaminate_start_time = None
-        self.approach_start_time = None  # NEW: Timer for approach timeout
+        self.approach_start_time = None  # Timer for approach timeout
         
         # Service call tracking
         self.service_future = None
@@ -569,7 +569,7 @@ class RobotController(Node):
                     self.navigator.clearAllCostmaps()
                     self.state = State.APPROACHING
                     self.collect_phase = CollectPhase.ALIGN
-                    self.approach_start_time = self.get_clock().now()  # NEW: Start approach timer
+                    self.approach_start_time = self.get_clock().now()  # Timer for approach timeout
                     self.nav_goal_sent = False
                     return
 
@@ -614,7 +614,7 @@ class RobotController(Node):
         # Visual servoing to approach detected barrel
         # ============================================================
         elif self.state == State.APPROACHING:
-            # --- NEW: TIMEOUT CHECK ---
+            # --- TIMEOUT CHECK ---
             # If approaching for too long, give up and move to next waypoint
             if self.approach_start_time is not None:
                 approach_elapsed = (self.get_clock().now() - self.approach_start_time).nanoseconds / 1e9
@@ -652,7 +652,7 @@ class RobotController(Node):
                 self.get_logger().warn("Lost barrel! Back to patrol.")
                 self.state = State.SEARCHING
                 self.current_target_size = 0
-                self.approach_start_time = None  # NEW: Reset timer
+                self.approach_start_time = None  # Reset timer
                 return
 
             # Visual servoing parameters
@@ -686,7 +686,7 @@ class RobotController(Node):
                     self.collect_phase = CollectPhase.TURN_AROUND
                     self.phase_start_time = self.get_clock().now()
                     self.current_target_size = 0
-                    self.approach_start_time = None  # NEW: Reset timer on success
+                    self.approach_start_time = None  # Reset timer on success
                 else:
                     # Drive forward with steering correction
                     twist.linear.x = 0.15
