@@ -75,7 +75,7 @@
             "num_robots": 1,
             "sensor_noise": "false",
             "obstacles": "false",
-            "random_seed": 0,
+            "random_seed": 67,
             "experiment_duration": "10800.0"
           }
         },
