@@ -1,54 +1,75 @@
-# AURO2025
-This is the repository for the AURO course's practicals.
+# Autonomous Multi-Robot Barrel Collection (ROS2)
 
-# Dev containers
-If you have Docker and VS Code installed, you can use the following instructions to spin up
-the Dev Container configuration contained in this repository to get started with ROS2.
+University of York, Autonomous Robotics (AURO) assessment, January 2026.
 
-1. Open VS Code
-2. Ensure that the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers) has been installed.
-3. In VS Code, open the command palette (eg. using the key combination `Shift+P` on Windows, or `Command+Shift+P`) and type `Dev Containers: Clone Repository in Container Volume`.
-3. Then select `GitHub` and select this repository's name/URL.
-4. Wait for the container to finish building.
+A team of TurtleBot3 Waffle Pi robots patrols a simulated Gazebo arena, finds contaminated barrels with a
+camera, picks them up, delivers them to a drop-off zone, and decontaminates itself when its radiation dose
+gets too high, all without human input.
 
-## Dev Container Configurations available
+> **Where the code is:** my solution lives in [`solution/`](solution). The other packages
+> (`assessment`, `assessment_interfaces`, `auro_interfaces`, `env_lab`, `week_*`) are the course-provided
+> simulation, message definitions, and weekly lab exercises.
 
-* `.devcontainer/devcontainer.json`: Uses VNC to expose a desktop and allow interaction with GUI applications via a VNC client or web browser at http://localhost:6080/
-* `.devcontainer/wsl/devcontainer.json`: Allows use of WSL2 to interact with GUI applications showing them natively on the Windows desktop. This option also takes advantage of GPU available on the host for rendering by leveraging support for translating OpenGL calls to Direct3D.
-* `.devcontainer/other/devcontainer.json`: Allows use of X11 for natively running the container on Linux with Docker. GUI applications are shown on the host operating system. See section below for additional configuration that is required.
+## How it works
 
-### auro-linux (Linux X11 native)
+Each robot runs its own `robot_controller` node (namespaced `robot1`, `robot2`, ...) built around an
+**8-state finite state machine**:
 
-The configuration assumes that the X11 cookie is available at `~/.X11authority`. Therefore, to use this configuration you should configure a symlink from `~/.X11authority` to `${XAUTHORITY}` when the session is started. For GNOME, this can be achieved, for example, by adding a new file under `~/.config/autostart` with the following content:
-
-```
-[Desktop Entry]
-Type=Application
-Exec=/bin/bash -c "ln -fs $XAUTHORITY ~/.X11authority"
-Hidden=false
-NoDisplay=true
-X-GNOME-Autostart-enabled=true
-Name=CreateSymlink
-Comment=Creates XAuthority symlink
-```
-
-Usually, this file is stored at `~/.Xauthority` when running under X11, however sessions running under Wayland, which is the default in recent versions of Ubuntu, expose an X Server via Xwayland, with the `XAuhtority` file being created at an unpredictable location, usually under `$XDG_RUNTIME_DIR/.mutter-Xwaylandauth.XXXXX`. Because any mounts configured for a Docker container become permanent, it becomes impractical to change them later on from the `devcontainer.json`, unless the container is deleted. For this reason, the Dev Container configuration for Linux requires that the `.XAuthority` file is available at `/.X11authority` instead.
-
-Depending on your GPU, you may also need to change the device under `runArgs` to use the appropriate interface. For Intel/AMD, the default `/dev/dri`
-should be adequate.
-
-### auro-wsl
-If using this configuration on a device that has an NVIDIA card, you may need to set the environment variable `MESA_D3D12_DEFAULT_ADAPTER_NAME` to `NVIDIA`, for example, using the command:
-```
-export MESA_D3D12_DEFAULT_ADAPTER_NAME=NVIDIA
-```
-You could make this permanent by extending the [`containerEnv`](https://github.com/UoY-RoboStar/AURO2025/blob/e7f7ab9b6657aad4d8715cd908829bc9dbb09e73/.devcontainer/wsl/devcontainer.json#L28-L33) section of the `.devcontainer/wsl/devcontainer.json` file, though note that you may need to change it back to use the configuration in the CS labs. You could, alternatively, consider creating a new configuration in your own repository.
-
-### auro-vnc
-To use auro-vnc on a Mac with Apple Silicon (arm64) machine, because the underlying Docker image is for the amd64 architecture, the first time you use the Dev Container you will need to pull the Docker image from the command line using the following command:
-
-```
-docker pull --platform linux/amd64 ghcr.io/uoy-robostar/ros2-tb3/auro-dev:latest
+```mermaid
+stateDiagram-v2
+    [*] --> SEARCHING
+    SEARCHING --> APPROACHING: barrel seen
+    APPROACHING --> SEARCHING: target lost
+    APPROACHING --> POSITIONING: close enough
+    POSITIONING --> PICKING_UP: aligned
+    PICKING_UP --> DELIVERING: picked up
+    PICKING_UP --> SEARCHING: pickup failed
+    DELIVERING --> OFFLOADING: at drop-off zone
+    OFFLOADING --> CLEARING_SPACE
+    CLEARING_SPACE --> DECONTAMINATING: radiation too high
+    CLEARING_SPACE --> SEARCHING
+    DECONTAMINATING --> SEARCHING
 ```
 
-Afterwards, if needed, you should be able to update the image using the Docker Desktop interface. If not, you can use the above command again.
+| State | What the robot does |
+|---|---|
+| `SEARCHING` | Patrols with Nav2 waypoints until the camera reports a barrel |
+| `APPROACHING` | Picks the best barrel and steers to it with proportional visual servoing |
+| `POSITIONING` | Aligns, turns around and backs up so the rear holder lines up (`CollectPhase`) |
+| `PICKING_UP` | Calls the `/pick_up_item` service |
+| `DELIVERING` | Navigates with Nav2 to the drop-off zone |
+| `OFFLOADING` | Calls `/offload_item` |
+| `CLEARING_SPACE` | Moves away so it doesn't block teammates |
+| `DECONTAMINATING` | Drives to the cyan zone, reverses in and calls `/decontaminate` |
+
+Other details:
+
+- **Obstacle avoidance:** the LiDAR scan is split into front / left / right sectors and the closest reading
+  in each drives avoidance. A dynamic LiDAR mask is toggled while carrying a barrel so the barrel isn't
+  seen as an obstacle.
+- **Multi-robot:** every robot reads the shared `/barrel_holders` and `/radiation_levels` topics so robots
+  don't chase the same barrel.
+- **Logging:** `data_logger` writes per-second counts of collected barrels and radiation to CSV.
+
+## Results
+
+Validated across five 3-hour test scenarios (different seeds and robot counts) with 90 to 100% barrel
+detection accuracy. Sample logs: `data_log_*.csv`.
+
+## Running it
+
+Requires Docker and VS Code with the Dev Containers extension. Open this repo in the dev container
+(`.devcontainer/devcontainer.json` gives a browser desktop at http://localhost:6080), then:
+
+```bash
+colcon build --symlink-install
+source install/setup.bash
+ros2 launch solution solution_launch.py num_robots:=2 random_seed:=1 experiment_duration:=600.0
+```
+
+Useful launch arguments: `num_robots`, `random_seed`, `experiment_duration` (seconds), `headless`,
+`use_rviz`, `sensor_noise`, `data_log_filename`.
+
+## Tech
+
+Python, ROS2, Nav2 (`nav2_simple_commander`), Gazebo, TurtleBot3, Docker
